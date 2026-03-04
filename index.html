@@ -1,0 +1,580 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta name="description"
+        content="DDP-WM: Disentangled Dynamics Prediction for Efficient World Models.">
+  <meta name="keywords" content="World Models, Model-based RL, Embodied AI, Efficient Transformer">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DDP-WM: Disentangled Dynamics Prediction for Efficient World Models</title>
+
+  <link href="https://fonts.googleapis.com/css?family=Google+Sans|Noto+Sans|Castoro"
+        rel="stylesheet">
+
+  <link rel="stylesheet" href="./static/css/bulma.min.css">
+  <link rel="stylesheet" href="./static/css/bulma-carousel.min.css">
+  <link rel="stylesheet" href="./static/css/bulma-slider.min.css">
+  <link rel="stylesheet" href="./static/css/fontawesome.all.min.css">
+  <link rel="stylesheet"
+        href="https://cdn.jsdelivr.net/gh/jpswalsh/academicons@1/css/academicons.min.css">
+  <link rel="stylesheet" href="./static/css/index.css">
+
+  <script src="https://ajax.googleapis.com/ajax/libs/jquery/3.5.1/jquery.min.js"></script>
+  <script defer src="./static/js/fontawesome.all.min.js"></script>
+  <script src="./static/js/bulma-carousel.min.js"></script>
+  <script src="./static/js/bulma-slider.min.js"></script>
+  <script src="./static/js/index.js"></script>
+
+  <style>
+    .tab-content {
+      display: none;
+    }
+    .tab-content.is-active {
+      display: block;
+    }
+    video {
+        width: 100%;
+        height: auto;
+    }
+  </style>
+</head>
+<body>
+
+<section class="hero">
+  <div class="hero-body">
+    <div class="container is-max-desktop">
+      <div class="columns is-centered">
+        <div class="column has-text-centered">
+          <h1 class="title is-1 publication-title">DDP-WM: Disentangled Dynamics Prediction for Efficient World Models</h1>
+          <div class="is-size-5 publication-authors">
+            <span class="author-block">Shicheng Yin<sup>1,*</sup>,</span>
+            <span class="author-block">Kaixuan Yin<sup>1,*</sup>,</span>
+            <span class="author-block">Weixing Chen<sup>1</sup>,</span>
+            <span class="author-block">Yang Liu<sup>1</sup>,</span>
+            <span class="author-block">Guanbin Li<sup>1</sup>,</span>
+            <span class="author-block">Liang Lin<sup>1,2</sup></span>
+          </div>
+
+          <div class="is-size-5 publication-authors">
+            <span class="author-block"><sup>*</sup>Equal contribution</span><br>
+            <span class="author-block">
+              <img src="static/images/sysu.png" style="height:1.3em; vertical-align: middle; margin-left: 5px; margin-bottom: 3px;">
+              <sup>1</sup>Sun Yat-sen University
+            </span>
+            <span class="author-block">
+              <img src="static/images/xera.png" style="height:1.3em; vertical-align: middle; margin-left: 5px; margin-bottom: 3px;">
+              <sup>2</sup>X-Era AI Lab
+            </span>
+          </div>
+
+          <div class="column has-text-centered">
+            <div class="publication-links">
+              <!-- Paper Link. -->
+              <span class="link-block">
+                <a href="https://arxiv.org/abs/2602.01780"
+                   class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon">
+                      <i class="ai ai-arxiv"></i>
+                  </span>
+                  <span>Paper</span>
+                </a>
+              </span>
+              <!-- Code Link. -->
+              <span class="link-block">
+                <a href="https://github.com/HCPLab-SYSU/DDP-WM"
+                   class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon">
+                      <i class="fab fa-github"></i>
+                  </span>
+                  <span>Code</span>
+                  </a>
+              </span>
+              <!-- Project Page Link. -->
+              <span class="link-block">
+                <a href="https://hcplab-sysu.github.io/DDP-WM/"
+                   class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon">
+                      <i class="fas fa-globe"></i>
+                  </span>
+                  <span>Project Page</span>
+                </a>
+              </span>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- Paper abstract. -->
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">Abstract</h2>
+        <div class="content has-text-justified">
+          <p>
+            World models are essential for autonomous robotic planning. However, the substantial computational overhead of existing dense Transformer-based models significantly hinders real-time deployment. To address this efficiency-performance bottleneck, we introduce DDP-WM, a novel world model centered on the principle of Disentangled Dynamics Prediction (DDP). We hypothesize that latent state evolution in observed scenes is heterogeneous and can be decomposed into sparse primary dynamics driven by physical interactions and secondary context-driven background updates. DDP-WM realizes this decomposition through an architecture that integrates efficient historical processing with dynamic localization to isolate primary dynamics. By employing a cross-attention mechanism for background updates, the framework optimizes resource allocation and provides a smooth optimization landscape for planners. Extensive experiments demonstrate that DDP-WM achieves significant efficiency and performance across diverse tasks, including navigation, precise tabletop manipulation, and complex deformable or multi-body interactions. Specifically, on the challenging Push-T task, DDP-WM achieves an approximately 9x inference speedup and improves the MPC success rate from 90% to 98% compared to state-of-the-art dense models.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+<!--/ Paper abstract. -->
+
+<!-- Motivation -->
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">Motivation: Redundancy and Sparsity</h2>
+        <div class="content has-text-justified">
+          <p>
+            Modern dense world models (e.g., DINO-WM) apply the same costly self-attention to all parts of an image, whether it's a moving object or a static wall. This creates a massive efficiency bottleneck. Our design is motivated by two key insights into the nature of physical dynamics in the feature space of pre-trained models like DINOv2:
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="columns is-centered">
+      <div class="column is-four-fifths">
+        <!-- Insight 1: Computational Redundancy -->
+        <div class="content has-text-centered">
+            <img src="static/images/motivation_redundancy.png" alt="PCA visualization showing static background features in a dense model." style="max-width: 80%; margin: auto; display: block;">
+            <p class="has-text-justified" style="margin-top: 1rem;">
+                <b>(1) Computational Redundancy:</b> We analyzed the internal features of a dense Transformer-based world model. As shown by the PCA visualization above, the features for background regions (most of the image) remain almost unchanged across multiple, computationally expensive layers. This confirms that vast amounts of computation are wasted on static parts of the scene.
+            </p>
+        </div>
+        <hr>
+        <!-- Insight 2: Inherent Sparsity -->
+        <div class="content has-text-centered" style="margin-top: 2rem;">
+            <img src="static/images/motivation_sparsity.png" alt="Visualization of the difference between consecutive frames, showing sparsity." style="max-width: 80%; margin: auto; display: block;">
+            <p class="has-text-justified" style="margin-top: 1rem;">
+                <b>(2) Inherent Sparsity:</b> The root cause of this redundancy is that physical dynamics are inherently sparse. By visualizing the difference between feature maps of two consecutive frames, we see that significant changes (non-green areas) occur in only a tiny fraction of the scene. This confirms that the core dynamics are localized and sparse.
+            </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+<!--/ Motivation -->
+
+
+
+<!-- Method -->
+<section class="section">
+    <div class="container is-max-desktop">
+        <div class="columns is-centered has-text-centered">
+            <div class="column is-four-fifths">
+              <h2 class="title is-3">Method: Disentangled Dynamics Prediction (DDP)</h2>
+              <div class="content has-text-justified">
+                <p>
+                    Based on these insights, we introduce <b>DDP-WM</b>, a world model built on the principle of <b>Disentangled Dynamics Prediction (DDP)</b>. The core idea is to decompose scene evolution into two distinct streams and allocate computational resources accordingly. Our architecture systematically implements this idea through several specialized modules:
+                </p>
+                <ul>
+                    <li>A <b>Dynamic Localization Network</b> first identifies the sparse regions where primary, action-driven dynamics will occur.</li>
+                    <li>A powerful <b>Sparse Primary Dynamics Predictor</b> then focuses all its computational power on these few important tokens to model complex physical interactions with high fidelity.</li>
+                    <li>Finally, a novel and highly efficient <b>Low-Rank Correction Module (LRM)</b> handles the subtle, context-driven updates to the vast static background, ensuring feature-space consistency with minimal cost.</li>
+                </ul>
+                <p>
+                    This intelligent allocation of computation is the key to achieving a massive leap in both efficiency and planning performance.
+                </p>
+              </div>
+            </div>
+        </div>
+        <div class="columns is-centered">
+            <div class="column is-full">
+                <img src="static/images/framework.png" alt="Overview of the DDP-WM Framework"/>
+                <p class="has-text-centered is-size-6" style="margin-top: 0.5rem;">
+                    <b>The DDP-WM Framework Overview.</b> A four-stage process: (1) historical information is fused, (2) dynamic regions are localized, (3) a powerful predictor models the sparse primary dynamics, and (4) an efficient LRM updates the background, providing a smooth landscape for planning.
+                </p>
+            </div>
+        </div>
+    </div>
+</section>
+<!--/ Method -->
+
+
+<!-- Finding: Plannable Landscape -->
+<section class="section">
+  <div class="container is-max-desktop">
+    <div class="columns is-centered has-text-centered">
+      <div class="column is-four-fifths">
+        <h2 class="title is-3">Finding: A Plannable Optimization Landscape</h2>
+        <div class="content has-text-justified">
+          <p>
+            Why does DDP-WM succeed in closed-loop planning where naive sparse models fail? The answer lies in the optimization landscape provided to the planner. Naive "copy-paste" for the background creates a rugged, noisy cost surface full of local minima. Our <b>Low-Rank Correction Module (LRM)</b> ensures feature-space consistency, resulting in a smooth, funnel-shaped landscape that enables the planner to efficiently find the optimal solution.
+          </p>
+        </div>
+      </div>
+    </div>
+
+    <div class="columns is-centered">
+      <div class="column">
+        <div class="content">
+          <img src="static/images/landscape_naive.png" alt="The MPC cost landscape of a naive sparse model is rugged and noisy, trapping the optimizer in local minima."/>
+          <p class="has-text-centered"><b>Naive Sparse Model:</b> A rugged, noisy landscape traps the optimizer.</p>
+        </div>
+      </div>
+      <div class="column">
+        <div class="content">
+          <img src="static/images/landscape_ddpwm.png" alt="The MPC cost landscape of our DDP-WM is smooth with a clear, funnel-shaped global minimum, enabling efficient optimization."/>
+          <p class="has-text-centered"><b>Our DDP-WM (w/ LRM):</b> A smooth landscape provides a clear path to the global minimum.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="columns is-centered has-text-centered">
+        <div class="column is-four-fifths">
+          <h3 class="title is-4">Why it Works: LRM Learns the True Low-Rank Structure</h3>
+          <div class="content has-text-justified">
+            <p>
+              This smooth landscape is possible because our LRM successfully learns the true, inherent low-rank structure of background dynamics. A PCA analysis shows the updates generated by our LRM almost perfectly match the low-dimensional nature of the ground-truth dynamics.
+            </p>
+          </div>
+          <img src="static/images/lrm_pca_analysis.png" alt="Parallel PCA analysis of LRM-predicted background updates and ground-truth updates, showing they share the same low-rank structure."/>
+        </div>
+      </div>
+  </div>
+</section>
+<!--/ Key Finding -->
+
+<!-- Results Overview -->
+<section class="section">
+    <div class="container is-max-desktop">
+        <div class="columns is-centered has-text-centered">
+            <div class="column is-four-fifths">
+              <h2 class="title is-3">Results at a Glance</h2>
+            </div>
+        </div>
+        <!-- Radar Chart -->
+        <div class="columns is-centered">
+            <div class="column is-three-fifths">
+                <img src="static/images/results_overview.png" alt="Radar chart showing overall performance gains of DDP-WM."/>
+            </div>
+        </div>
+        <!-- Tables -->
+        <div class="columns is-centered">
+            <div class="column is-full">
+                <div class="content">
+                    <h3 class="title is-4 has-text-centered">Planning Performance</h3>
+                    <p class="has-text-centered">DDP-WM matches or surpasses SOTA dense models on all tasks, with significant gains on complex manipulation.</p>
+                    <table class="table is-bordered is-striped is-narrow is-hoverable is-fullwidth">
+                        <thead>
+                            <tr>
+                                <th>Model</th>
+                                <th>PointMaze (SR ↑)</th>
+                                <th>Push-T (SR ↑)</th>
+                                <th>Wall (SR ↑)</th>
+                                <th>Rope (CD ↓)</th>
+                                <th>Granular (CD ↓)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>DINO-WM</td>
+                                <td>98%</td>
+                                <td>90%</td>
+                                <td>98%</td>
+                                <td>0.41</td>
+                                <td>0.26</td>
+                            </tr>
+                            <tr>
+                                <td><b>DDP-WM (Ours)</b></td>
+                                <td><b>100%</b></td>
+                                <td><b>98%</b></td>
+                                <td><b>96%</b></td>
+                                <td><b>0.31</b></td>
+                                <td><b>0.24</b></td>
+                            </tr>
+                        </tbody>
+                    </table>
+
+                    <h3 class="title is-4 has-text-centered" style="margin-top: 2.5em;">MPC Decision Time</h3>
+                    <p class="has-text-centered">Our model provides significant speedups in the full MPC loop, enabling higher-frequency control.</p>
+                    <table class="table is-bordered is-striped is-narrow is-hoverable is-fullwidth">
+                        <thead>
+                            <tr>
+                                <th>Task / Iterations</th>
+                                <th>DINO-WM</th>
+                                <th>DDP-WM (Ours)</th>
+                                <th>Speedup</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            <tr>
+                                <td>PointMaze / 10</td>
+                                <td>39 s</td>
+                                <td><b>5.5 s</b></td>
+                                <td><b>7.1x</b></td>
+                            </tr>
+                            <tr>
+                                <td>Push-T / 30</td>
+                                <td>120 s</td>
+                                <td><b>16 s</b></td>
+                                <td><b>7.5x</b></td>
+                            </tr>
+                            <tr>
+                                <td>Wall / 10</td>
+                                <td>12 s</td>
+                                <td><b>4.2 s</b></td>
+                                <td><b>2.9x</b></td>
+                            </tr>
+                            <tr>
+                                <td>Rope / 10</td>
+                                <td>12 s</td>
+                                <td><b>4.3 s</b></td>
+                                <td><b>2.8x</b></td>
+                            </tr>
+                             <tr>
+                                <td>Granular / 30</td>
+                                <td>35 s</td>
+                                <td><b>13 s</b></td>
+                                <td><b>2.7x</b></td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+<!--/ Results Overview -->
+
+
+
+
+<!-- Open-Loop Rollouts -->
+<section class="hero is-light">
+<section class="section">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">Open-Loop Prediction: Higher Fidelity Rollouts</h2>
+      <div class="content has-text-justified">
+          <p>
+              Qualitative comparisons of 5-step open-loop rollouts highlight DDP-WM's ability to generate high-fidelity predictions. While the dense baseline (DINO-WM) is powerful, its predictions can sometimes degrade over the horizon, accumulating blurriness or visual artifacts (e.g., rigid objects appearing to distort). In contrast, DDP-WM shows a greater tendency to produce sharp and physically coherent rollouts that better preserve key details. Each animation below shows results from DINO-WM (top row), DDP-WM (middle row), and the ground truth (bottom row).
+          </p>
+      </div>
+
+
+      <div class="tabs is-centered is-boxed">
+        <ul>
+          <li class="is-active" data-tab="1"><a>Push-T</a></li>
+          <li data-tab="2"><a>Granular</a></li>
+          <li data-tab="3"><a>Rope</a></li>
+        </ul>
+      </div>
+
+      <div class="tab-content-container">
+          <!-- Push-T -->
+          <div class="tab-content is-active" data-content="1">
+              <div class="columns is-centered">
+                  <div class="column">
+                      <p class="has-text-centered">Sample 1</p>
+                      <img src="./static/videos/pusht_1.gif" alt="Push-T rollout sample 1"/>
+                  </div>
+                  <div class="column">
+                      <p class="has-text-centered">Sample 2</p>
+                      <img src="./static/videos/pusht_2.gif" alt="Push-T rollout sample 2"/>
+                  </div>
+                  <div class="column">
+                      <p class="has-text-centered">Sample 3</p>
+                      <img src="./static/videos/pusht_3.gif" alt="Push-T rollout sample 3"/>
+                  </div>
+              </div>
+          </div>
+          <!-- Granular -->
+          <div class="tab-content" data-content="2">
+              <div class="columns is-centered">
+                  <div class="column">
+                      <p class="has-text-centered">Sample 1</p>
+                      <img src="./static/videos/granular_1.gif" alt="Granular rollout sample 1"/>
+                  </div>
+                  <div class="column">
+                      <p class="has-text-centered">Sample 2</p>
+                      <img src="./static/videos/granular_2.gif" alt="Granular rollout sample 2"/>
+                  </div>
+                  <div class="column">
+                      <p class="has-text-centered">Sample 3</p>
+                      <img src="./static/videos/granular_3.gif" alt="Granular rollout sample 3"/>
+                  </div>
+              </div>
+          </div>
+          <!-- Rope -->
+          <div class="tab-content" data-content="3">
+              <div class="columns is-centered">
+                  <div class="column">
+                      <p class="has-text-centered">Sample 1</p>
+                      <img src="./static/videos/rope_1.gif" alt="Rope rollout sample 1"/>
+                  </div>
+                  <div class="column">
+                      <p class="has-text-centered">Sample 2</p>
+                      <img src="./static/videos/rope_2.gif" alt="Rope rollout sample 2"/>
+                  </div>
+                  <div class="column">
+                      <p class="has-text-centered">Sample 3</p>
+                      <img src="./static/videos/rope_3.gif" alt="Rope rollout sample 3"/>
+                  </div>
+              </div>
+          </div>
+      </div>
+    </div>
+</section>
+</section>
+<!--/ Open-Loop Rollouts -->
+
+
+<!-- Closed-Loop Planning -->
+<section class="section">
+    <div class="container is-max-desktop">
+      <h2 class="title is-3 has-text-centered">Closed-Loop Planning on Push-T</h2>
+      <div class="content has-text-justified">
+        <p>
+            Below are side-by-side comparisons of MPC planning on the Push-T task. DDP-WM not only achieves a higher success rate (98% vs. 90%) but also demonstrates more precise and direct control. In cases where the dense baseline fails, DDP-WM often finds a successful trajectory.
+        </p>
+      </div>
+
+      <h3 class="title is-4 has-text-centered" style="margin-top: 2em;">Successful Planning Comparison</h3>
+      <!-- Success Pair 1 -->
+      <div class="columns is-centered">
+          <div class="column has-text-centered">
+              <b>DINO-WM (Success)</b>
+              <video poster="" autoplay controls muted loop playsinline>
+                  <source src="./static/videos/compare_success_1_dinowm.mp4" type="video/mp4">
+              </video>
+          </div>
+          <div class="column has-text-centered">
+              <b>DDP-WM (Success)</b>
+              <video poster="" autoplay controls muted loop playsinline>
+                  <source src="./static/videos/compare_success_1_ours.mp4" type="video/mp4">
+              </video>
+          </div>
+      </div>
+      <!-- Success Pair 2 -->
+      <div class="columns is-centered">
+          <div class="column has-text-centered">
+              <b>DINO-WM (Success)</b>
+              <video poster="" autoplay controls muted loop playsinline>
+                  <source src="./static/videos/compare_success_2_dinowm.mp4" type="video/mp4">
+              </video>
+          </div>
+          <div class="column has-text-centered">
+              <b>DDP-WM (Success)</b>
+              <video poster="" autoplay controls muted loop playsinline>
+                  <source src="./static/videos/compare_success_2_ours.mp4" type="video/mp4">
+              </video>
+          </div>
+      </div>
+      <!-- Success Pair 3 -->
+      <div class="columns is-centered">
+          <div class="column has-text-centered">
+              <b>DINO-WM (Success)</b>
+              <video poster="" autoplay controls muted loop playsinline>
+                  <source src="./static/videos/compare_success_3_dinowm.mp4" type="video/mp4">
+              </video>
+          </div>
+          <div class="column has-text-centered">
+              <b>DDP-WM (Success)</b>
+              <video poster="" autoplay controls muted loop playsinline>
+                  <source src="./static/videos/compare_success_3_ours.mp4" type="video/mp4">
+              </video>
+          </div>
+      </div>
+
+      <h3 class="title is-4 has-text-centered" style="margin-top: 2em;">Failure Recovery</h3>
+      <p class="has-text-centered content">DDP-WM successfully solves trajectories where DINO-WM fails.</p>
+
+      <!-- Failure Recovery Pair 1 -->
+      <div class="columns is-centered">
+          <div class="column has-text-centered">
+              <b>DINO-WM (Failure)</b>
+              <video poster="" autoplay controls muted loop playsinline>
+                  <source src="./static/videos/compare_false_1_dinowm.mp4" type="video/mp4">
+              </video>
+          </div>
+          <div class="column has-text-centered">
+              <b>DDP-WM (Solves the case)</b>
+              <video poster="" autoplay controls muted loop playsinline>
+                  <source src="./static/videos/compare_win_1_ours.mp4" type="video/mp4">
+              </video>
+          </div>
+      </div>
+      <!-- Failure Recovery Pair 2 -->
+      <div class="columns is-centered">
+          <div class="column has-text-centered">
+              <b>DINO-WM (Failure)</b>
+              <video poster="" autoplay controls muted loop playsinline>
+                  <source src="./static/videos/compare_false_2_dinowm.mp4" type="video/mp4">
+              </video>
+          </div>
+          <div class="column has-text-centered">
+              <b>DDP-WM (Solves the case)</b>
+              <video poster="" autoplay controls muted loop playsinline>
+                  <source src="./static/videos/compare_win_2_ours.mp4" type="video/mp4">
+              </video>
+          </div>
+      </div>
+    </div>
+</section>
+<!--/ Closed-Loop Planning -->
+
+
+<section class="section" id="BibTeX">
+  <div class="container is-max-desktop content">
+    <h2 class="title">BibTeX</h2>
+    <pre><code>@misc{yin2026ddpwmdisentangleddynamicsprediction,
+      title={DDP-WM: Disentangled Dynamics Prediction for Efficient World Models}, 
+      author={Shicheng Yin and Kaixuan Yin and Weixing Chen and Yang Liu and Guanbin Li and Liang Lin},
+      year={2026},
+      eprint={2602.01780},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2602.01780}, 
+}</code></pre>
+  </div>
+</section>
+
+
+<footer class="footer">
+  <div class="container">
+    <div class="columns is-centered">
+      <div class="column is-8">
+        <div class="content">
+          <p>
+            This page was built using the <a
+            href="https://github.com/nerfies/nerfies.github.io">Nerfies</a> template.
+          </p>
+        </div>
+      </div>
+    </div>
+  </div>
+</footer>
+
+<script>
+    document.addEventListener('DOMContentLoaded', () => {
+        const tabs = document.querySelectorAll('.tabs li');
+        const tabContents = document.querySelectorAll('.tab-content');
+
+        tabs.forEach(tab => {
+            tab.addEventListener('click', () => {
+                // Deactivate all tabs and content
+                tabs.forEach(item => item.classList.remove('is-active'));
+                tabContents.forEach(content => content.classList.remove('is-active'));
+
+                // Activate the clicked tab
+                tab.classList.add('is-active');
+
+                // Activate the corresponding content
+                const target = tab.dataset.tab;
+                const targetContent = document.querySelector(`.tab-content[data-content="${target}"]`);
+                if (targetContent) {
+                    targetContent.classList.add('is-active');
+                }
+            });
+        });
+    });
+</script>
+</body>
+</html>
