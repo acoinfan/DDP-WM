@@ -1,6 +1,8 @@
+# Copyright 2026 ddpwm
+# Portions derived from the DDP-WM / dino_wm reference implementation; see third_party/README.md.
+# SPDX-License-Identifier: MIT
 # env import
 import gym
-import einops
 from gym import spaces
 from pymunk.space_debug_draw_options import SpaceDebugColor
 from pymunk.vec2d import Vec2d
@@ -14,7 +16,6 @@ import skimage.transform as st
 import pymunk.pygame_util
 import collections
 from matplotlib import cm
-import torch
 
 # @markdown ### **Environment**
 # @markdown Defines a PyMunk-based Push-T environment `PushTEnv`.

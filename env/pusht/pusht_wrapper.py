@@ -1,8 +1,10 @@
-import os
+# Copyright 2026 ddpwm
+# Portions derived from the DDP-WM / dino_wm reference implementation; see third_party/README.md.
+# SPDX-License-Identifier: MIT
 import numpy as np
-import gym
+
+from common.aggregate import aggregate_dct
 from env.pusht.pusht_env import PushTEnv
-from utils import aggregate_dct
 
 class PushTWrapper(PushTEnv):
     def __init__(
@@ -117,3 +119,5 @@ class PushTWrapper(PushTEnv):
         states = np.vstack([np.expand_dims(state, 0), infos["state"]])
         states = np.stack(states)
         return obses, states
+
+    # NOTE: this method used to be called by a legacy Chinese name; `rollout` is the public name.

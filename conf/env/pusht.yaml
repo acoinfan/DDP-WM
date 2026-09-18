@@ -1,19 +1,15 @@
+# Dataset wiring for one environment (single source of truth).
+# train_ddpwm.py::build_dataset() reads this file, injects num_hist / num_pred / frameskip /
+# data_path / transform into `dataset`, and instantiates the loader given by dataset._target_.
+# Adding an environment = adding a YAML file here; no Python changes required.
+# A run config may override individual keys through its optional top-level `env:` block.
 name: pusht
-args: []
-kwargs: 
-  with_velocity: true
-  with_target: true
-
+# No default root: the dataset is not shipped. Set it with --data-dir <root>, $DDPWM_DATA_DIR, or
+# by editing this key; data_path = <root>/<data_subdir>.
+data_root: null
+data_subdir: pusht_noise
 dataset:
-  _target_: "datasets.pusht_dset.load_pusht_slice_train_val"
-  with_velocity: true
+  _target_: dsets.pusht_dset.load_pusht_slice_train_val
   n_rollout: null
-  normalize_action: ${normalize_action}
-  data_path: ${oc.env:DATASET_DIR}/pusht_noise
-  split_ratio: 0.9
-  transform:
-    _target_: "datasets.img_transforms.default_transform"
-    img_size: ${img_size}
-
-decoder_path: null
-num_workers: 6
+  normalize_action: true
+  with_velocity: true

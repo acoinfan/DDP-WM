@@ -1,17 +1,16 @@
+# Dataset wiring for one environment (single source of truth).
+# train_ddpwm.py::build_dataset() reads this file, injects num_hist / num_pred / frameskip /
+# data_path / transform into `dataset`, and instantiates the loader given by dataset._target_.
+# Adding an environment = adding a YAML file here; no Python changes required.
+# A run config may override individual keys through its optional top-level `env:` block.
+# Parameters follow the wall configuration of the reference implementation.
 name: wall
-args: []
-kwargs: {}
-
+# No default root: the dataset is not shipped. Set it with --data-dir <root> or $DDPWM_DATA_DIR.
+data_root: null
+data_subdir: wall_single
 dataset:
-  _target_: "datasets.wall_dset.load_wall_slice_train_val"
+  _target_: dsets.wall_dset.load_wall_slice_train_val
   n_rollout: null
-  normalize_action: ${normalize_action}
-  data_path: ${oc.env:DATASET_DIR}/wall_single
+  normalize_action: true
   split_ratio: 0.9
-  split_mode: "random"
-  transform:
-    _target_: "datasets.img_transforms.default_transform"
-    img_size: ${img_size}
-
-decoder_path: null
-num_workers: 6
+  split_mode: random

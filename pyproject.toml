@@ -1,0 +1,82 @@
+# Project metadata. This is a runnable reproduction rather than a library: install it editable
+# (`pip install -e '.[env,dev]'`) so the packages below resolve to this source tree, and run the
+# entry points (`train_ddpwm.py`, `python -m dino_planning.plan`) from the repository root.
+[build-system]
+requires = ["setuptools>=77"]          # PEP 639: `license = "MIT"` needs setuptools >= 77
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["models", "dsets", "env", "env.pusht", "dino_planning", "common"]
+py-modules = ["train_ddpwm"]
+
+[project.scripts]
+ddpwm-train = "train_ddpwm:main"    # `python -m dino_planning.plan` is the evaluation entry point
+
+[project]
+name = "ddpwm"
+version = "0.1.0"
+description = "DDP-WM reproduction: classifier -> predictor -> LRM training plus MPC/CEM evaluation on PushT"
+readme = "README.md"
+requires-python = ">=3.10"
+license = "MIT"                                        # SPDX expression (setuptools >= 77)
+license-files = ["LICENSE", "third_party/dino_wm/LICENSE", "third_party/dinov2/LICENSE"]
+authors = [{ name = "ddpwm" }]        # project name only, no personal names
+keywords = ["world-models", "model-predictive-control", "diffusion-policy", "reproduction", "pusht"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+]
+dependencies = [
+    "torch>=2.0",
+    "torchvision",
+    "numpy",
+    "einops",
+    "tqdm",
+    "accelerate",
+    "omegaconf",
+    "hydra-core",
+    "PyYAML",
+    "Pillow",       # image loading in the dsets (needed by training and by the evaluation dataset)
+]
+
+[project.optional-dependencies]
+# Everything the PushT gym environment (evaluation / planning only) imports at module level.
+env = [
+    "gym",
+    "pymunk>=6,<7",                 # pymunk 7 dropped Space.add_collision_handler() (vendored PushT env)
+    "shapely",
+    "pygame",
+    "scikit-image",
+    "opencv-python",
+    "matplotlib",                   # imported by the vendored env/pusht/pusht_env.py
+]
+# Only for datasets stored as `obses/*.mp4`: the PushT loader falls back to decord for that layout.
+# decord publishes a single wheel built for cp36 + manylinux2010, which is not installable everywhere,
+# so it is optional and imported lazily (the pre-extracted PNG layout needs nothing extra).
+datasets = ["decord"]
+dev = ["pytest"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+# env/pusht/ is vendored verbatim (see third_party/README.md) and is left as upstream wrote it.
+extend-exclude = '(^|/)env/pusht'
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+exclude = ["env/pusht"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501", "E741", "B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E402"]        # the test files add the repository root to sys.path before importing
+# entry point: inserts the repository root into sys.path before importing the project packages,
+# so its own imports are not at the top of the file by construction
+"train_ddpwm.py" = ["E402"]

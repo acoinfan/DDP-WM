@@ -1,0 +1,72 @@
+# =============================================================================
+# DDP-WM training configuration (default `--config` for train_ddpwm.py).
+# Every run copies this file to runs/run_XXXX/config.yaml.
+#
+# Priority (low -> high): this file (or a run config via --config)  ->  command line.
+# Dataset wiring has its own layer: conf/env/<env>.yaml, which a run config can override
+# through its optional top-level `env:` block.
+#
+# Only keys that are actually read are listed below. Everything else is hard-coded in the
+# code (the dataset always has the same layout); it is documented here so readers do not
+# have to hunt for it:
+#
+#   image_size                     = 224    train_ddpwm.build_model / dsets.img_transforms.default_transform
+#   encoder                        = DINOv2 ViT-S/14, frozen   models/dino.py (train_encoder=False)
+#   action / proprio embedding dim = 10     build_model: ProprioceptiveEmbedding(emb_dim=10)
+#   num_pred                       = 1      build_model / build_dataset
+#   num_action_repeat = num_proprio_repeat = 1
+#
+#   classifier : reduced_dim=192, num_layers=6, num_heads=3, mlp_dim=768,
+#                partition=4 (2x2 sub-patches per patch), k_max=32,
+#                cls_pos_weight=10.0, pixel_threshold=0.1
+#   predictor  : num_layers=6, num_heads=16, mlp_dim=2048, k_max=32
+#   lrm        : num_heads=4, n_patches=196 (14x14)
+#
+#   Those constants live in models/ddp_predictor.py (top of file) and train_ddpwm.build_model().
+#   Distributed: the process count comes from `torchrun --nproc_per_node`; NCCL P2P/IB are
+#   disabled inside train_ddpwm.py through os.environ.setdefault.
+# =============================================================================
+
+# ---------- Shared by all three stages ----------
+common:
+  env: pusht                              # dataset wiring -> conf/env/<env>.yaml (--env overrides)
+  # Dataset root. Up to four layers, highest priority first:
+  #   --data-dir <dir>  >  $DDPWM_DATA_DIR  >  this key  >  conf/env/<env>.yaml (data_root)
+  # All of them are empty by default on purpose: the datasets are not shipped, so a run has to be
+  # pointed at them explicitly (build_dataset lists every path it tried when nothing is found).
+  data_dir: null
+  batch_size: 64                          # global batch (8 per GPU on 8 GPUs)
+  num_workers: 6                          # DataLoader workers
+  frameskip: 5                            # frames between observations; actions concatenate to 10 dims
+
+# ---------- Stage 1: classifier (--stage classifier) ----------
+classifier:
+  epochs: 2
+  lr: 7e-4
+  num_hist: 3                             # the classifier sees 3 frames (predictor/LRM use 5)
+
+# ---------- Stage 2: predictor (--stage predictor) ----------
+# Two-step recipe (see --history-fusion-disabled): 1) train with a random ViT and a single frame,
+# 2) warm start from that checkpoint (--predictor-ckpt) and let the frozen 3-frame history fusion
+# inherited from the classifier feed the ViT. All other hyper-parameters are shared.
+predictor:
+  epochs: 2
+  lr: 7e-4
+  num_hist: 5
+  classifier_ckpt: null                   # required on the command line (--classifier-ckpt); no default
+
+# ---------- Stage 3: LRM (--stage lrm) ----------
+# A single cross-attention layer (~734k trainable params); ViT / history fusion / localizer frozen.
+lrm:
+  epochs: 2
+  lr: 7e-4
+  num_hist: 5
+  predictor_ckpt: null                    # required on the command line (--predictor-ckpt)
+  classifier_ckpt: null                   # optional: override the classifier bundled with the predictor
+
+# ---------- Logging ----------
+logging:
+  log_every_n_steps: 10                   # write one training-CSV row every N steps (--log-every-n-steps)
+  save_every_n_epochs: 1                  # save model_<N>.pth at the end of every N epochs
+                                          # (--save-every-n-epochs; 0 = never at epoch end)
+                                          # mid-epoch resumable saves: --save-every-n-steps N

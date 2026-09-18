@@ -1,4 +1,60 @@
-__pycache__
-临时代码
-ls_py.py
-project_structure_and_code.txt
+# ===== Weights and large files =====
+# No checkpoint is committed. The staged trainer writes them into runs/, and `pretrained/` (the
+# converted stage checkpoints plus `pretrained/ddpwm_pusht.pth`, the complete PushT model) is a
+# local-only directory: it stays in the working tree so evaluations can run, but the whole folder
+# is ignored by git.
+pretrained/
+*.pth
+*.pt
+*.ckpt
+*.pkl
+*.safetensors
+
+# ===== Training / evaluation output =====
+runs/
+plan_outputs/
+evals/
+evals_test/
+logging/
+csv_log/
+wandb/
+
+# ===== Local-only archives (see the repository cleanup notes) =====
+_archive/
+_archive_md/
+garbage/
+CKPT_backup/
+artifacts/
+history/
+
+# ===== Internal tooling, not part of the published repository =====
+# _audit/ : our own comparison/diagnostic scripts (index in _audit/README.md). Untracked on
+# purpose; the files stay in the working tree and in the git history up to the cleanup.
+_audit/
+# docs/ : reproduction notes and publishing TODO. Same treatment.
+docs/
+
+# ===== Logs =====
+*.out
+*.log
+logs.json
+
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.ipynb_checkpoints/
+
+# ===== Misc =====
+*.tmp
+*.bak
+*.bak_*
+*.backup
+.*.swp
+.mcp.json
+.pytest_cache/
+.ruff_cache/

@@ -1,0 +1,131 @@
+# =============================================================================
+# Example training-run configuration (commented, equivalent to conf/ddpwm.yaml)
+#
+# This file is NOT loaded automatically; it exists as documentation. Typical use:
+#
+#     cp conf/example_run.yaml runs/run_XXXX/config.yaml
+#     python -m torch.distributed.run --nproc_per_node=8 train_ddpwm.py \
+#         --stage predictor --config runs/run_XXXX/config.yaml \
+#         --classifier-ckpt runs/run_XXXX/checkpoints/classifier/model_latest.pth \
+#         --predictor-ckpt runs/run_XXXX/checkpoints/predictor_single_frame/model_latest.pth
+#
+# Priority (low -> high): this file (or a run config via --config)  ->  command line.
+# Dataset wiring has its own layer: conf/env/<env>.yaml  ->  the optional `env:` block below.
+# =============================================================================
+
+# ---------- Shared by all three stages ----------
+common:
+  env: pusht                  # selects the dataset wiring in conf/env/<env>.yaml
+                              # available: pusht / point_maze / wall / deformable_env (--env overrides)
+  data_dir: null              # dataset root: --data-dir > $DDPWM_DATA_DIR > this key > conf/env/<env>.yaml
+                              # all of them are empty by default (the datasets are not shipped)
+  batch_size: 64              # global batch (8 per GPU on 8 GPUs; --batch-size overrides)
+  num_workers: 6              # DataLoader workers (--num-workers overrides)
+  frameskip: 5                # 5 simulation steps between observations; actions concatenate to 10 dims
+
+# ---------- Optional: pin the dataset wiring of this run ----------
+# Uncomment to freeze where this run takes its data from (recommended for provenance).
+# It overrides the same keys in conf/env/pusht.yaml.
+# env:
+#   name: pusht
+#   data_root: /path/to/data
+#   data_subdir: pusht_noise
+#   dataset:
+#     normalize_action: true
+
+# ---------- Stage 1: classifier (--stage classifier) ----------
+# Trains the history fusion, the foreground localizer and the action/proprio encoders.
+# Its output supplies the sparse mask used by the predictor and by the LRM rollout.
+classifier:
+  epochs: 2                   # --epochs overrides
+  lr: 7e-4                    # --lr overrides
+  num_hist: 3                 # the classifier sees 3 frames (predictor/LRM use 5)
+
+# ---------- Stage 2: predictor (--stage predictor) ----------
+# Two-step recipe (the only stage with more than one recipe):
+#   1) --history-fusion-disabled: start from a RANDOM ViT, single-frame input (no history fusion),
+#      32-token sparse ViT + classifier-masked MSE + GT-filled rollout (teacher forcing),
+#      gradients accumulated per history length h.
+#   2) the default recipe: warm start from that checkpoint (--predictor-ckpt); the input becomes
+#      the frozen 3-frame history fusion inherited from the classifier.
+predictor:
+  epochs: 2                   # --epochs overrides
+  lr: 7e-4                    # --lr overrides
+  num_hist: 5                 # 5 frames = 3 seed frames + 2 rollout steps
+  classifier_ckpt: null       # required: pass --classifier-ckpt (no default weights)
+
+# ---------- Stage 3: LRM (--stage lrm) ----------
+# A single cross-attention layer (~734k trainable params); ViT / history fusion / localizer frozen.
+# The rollout is self-predicted (single real observation per step + classifier mask).
+lrm:
+  epochs: 2                   # --epochs overrides
+  lr: 7e-4                    # --lr overrides
+  num_hist: 5
+  predictor_ckpt: null        # required: pass --predictor-ckpt
+  classifier_ckpt: null       # optional: override the classifier bundled with the predictor
+
+# ---------- Logging ----------
+logging:
+  log_every_n_steps: 10       # one training-CSV row every N steps (--log-every-n-steps);
+                              # the epoch-end summary row is written regardless
+  save_every_n_epochs: 1      # save model_<N>.pth / model_latest.pth at the end of every N epochs
+                              # (--save-every-n-epochs; 0 = never at epoch end)
+                              # mid-epoch resumable saves: --save-every-n-steps N
+
+# =============================================================================
+# Hard-coded constants (not configurable here; change the code instead)
+#   image_size                     = 224     train_ddpwm.build_model / dsets.img_transforms.default_transform
+#   encoder                        = DINOv2 ViT-S/14, frozen    models/dino.py (train_encoder=False)
+#   action / proprio embedding dim = 10      build_model: ProprioceptiveEmbedding(emb_dim=10)
+#   num_pred                       = 1
+#   num_action_repeat = num_proprio_repeat = 1
+#   classifier : reduced_dim=192, num_layers=6, num_heads=3, mlp_dim=768,
+#                partition=4 (2x2 sub-patches per patch), k_max=32,
+#                cls_pos_weight=10.0, pixel_threshold=0.1
+#   predictor  : num_layers=6, num_heads=16, mlp_dim=2048, k_max=32
+#   lrm        : num_heads=4, n_patches=196 (14x14)
+#   Defined in models/ddp_predictor.py (top of file) and train_ddpwm.build_model().
+#   Distributed: process count comes from torchrun --nproc_per_node; NCCL P2P/IB are
+#   disabled inside train_ddpwm.py.
+# =============================================================================
+# Full commands for the three stages (8 GPUs)
+#
+# 1) classifier (the reproduction chain uses the released classifier checkpoint; run this
+#    only if you want to retrain it from scratch)
+#   python -m torch.distributed.run --nproc_per_node=8 train_ddpwm.py \
+#     --stage classifier --epochs 2 --lr 7e-4 \
+#     --output-dir runs/run_XXXX/checkpoints/classifier
+#
+# 2) predictor, step 1: single frame, random ViT start
+#   python -m torch.distributed.run --nproc_per_node=8 train_ddpwm.py \
+#     --stage predictor --history-fusion-disabled \
+#     --classifier-ckpt runs/run_XXXX/checkpoints/classifier/model_latest.pth \
+#     --epochs 2 --lr 7e-4 --save-every-n-steps 1000 \
+#     --output-dir runs/run_XXXX/checkpoints/predictor_single_frame
+#
+# 3) predictor, step 2: frozen 3-frame history fusion, warm start from step 1
+#   python -m torch.distributed.run --nproc_per_node=8 train_ddpwm.py \
+#     --stage predictor \
+#     --classifier-ckpt runs/run_XXXX/checkpoints/classifier/model_latest.pth \
+#     --predictor-ckpt runs/run_XXXX/checkpoints/predictor_single_frame/model_latest.pth \
+#     --epochs 2 --lr 7e-4 --save-every-n-steps 5000 \
+#     --output-dir runs/run_YYYY/checkpoints/predictor
+#
+# 4) LRM
+#   python -m torch.distributed.run --nproc_per_node=8 train_ddpwm.py \
+#     --stage lrm \
+#     --classifier-ckpt runs/run_XXXX/checkpoints/classifier/model_latest.pth \
+#     --predictor-ckpt runs/run_YYYY/checkpoints/predictor/model_latest.pth \
+#     --epochs 2 --lr 7e-4 --save-every-n-steps 5000 \
+#     --output-dir runs/run_ZZZZ/checkpoints/lrm
+#
+# Evaluation (one directory per evaluation):
+#   python -m dino_planning.plan \
+#     ddpwm_ckpt=runs/run_ZZZZ/checkpoints/lrm/model_latest.pth seed=99 n_evals=50 \
+#     use_sparse_cost=true eval_dir=runs/run_ZZZZ/planning/s99 \
+#     hydra.run.dir=runs/run_ZZZZ/planning/s99
+#
+# Note: every experimental switch of earlier revisions has been removed. A stage has exactly one
+#   recipe, so `--stage {classifier,predictor,lrm}` plus `--history-fusion-disabled` (predictor
+#   only) covers the whole pipeline.
+# =============================================================================

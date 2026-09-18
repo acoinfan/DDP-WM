@@ -1,556 +1,776 @@
-# file: models/ddp_predictor.py
+# Copyright 2026 ddpwm
+# Portions derived from the DDP-WM / dino_wm reference implementation; see third_party/README.md.
+# SPDX-License-Identifier: MIT
+"""
+DDP-WM Predictor: Clean three-stage training implementation.
 
+Architecture (matching paper exactly):
+  Stage 1: Historical Information Fusion (cross-attention to history)
+  Stage 2: Dynamic Localization Network (lightweight ViT classifier)
+  Stage 3: Sparse Primary Dynamics Predictor (full ViT on foreground tokens only)
+  Stage 4: Low-Rank Correction Module (cross-attention from BG to FG)
+
+Training stages:
+  'classifier'        -> Train Stage 1+2 jointly (history fusion + localization)
+  'predictor' -> Freeze 1+2, train Stage 3
+  'lrm'              -> Freeze 1+2+3, train Stage 4
+  'inference'        -> All frozen, full forward pass
+
+Usage:
+  predictor = DDP_Predictor(training_stage='classifier', ...)
+  predictor = DDP_Predictor(training_stage='predictor', classifier_ckpt='path/to/cls.pth', ...)
+  predictor = DDP_Predictor(training_stage='lrm', predictor_ckpt='path/to/pred.pth', ...)
+"""
+
+import logging
 import math
+import os
+from typing import Literal
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from einops import rearrange
-from typing import Dict, List, Literal, Optional, Tuple
+from torch import Tensor
 
-from .utils import *
+from .ckpt_io import load_checkpoint
+from .ckpt_layout import assert_current_layout
 from .vit import ViTPredictor
 
+log = logging.getLogger(__name__)
 
-# ====================================================================
-#  Stage 1: HistoricalInformationFusionModule (Historical Information Fusion)
-# ====================================================================
+
+# ==============================================================================
+# Configuration Constants
+# ==============================================================================
+
+GRID_SIZE = 14  # DINOv2 ViT-S/14 produces 14x14 patch grid
+N_PATCHES = GRID_SIZE * GRID_SIZE  # 196
+D_VISUAL = 384  # DINOv2 ViT-S feature dimension
+D_ACTION_EMB = 10  # Action embedding dimension after ProprioceptiveEmbedding
+D_PROPRIO_EMB = 10  # Proprio embedding dimension
+D_MODEL = D_VISUAL + D_ACTION_EMB + D_PROPRIO_EMB  # 404, full token dimension
+
+# Classifier (Stage 2) architecture
+CLS_REDUCED_DIM = 192  # Dimensionality reduction before small ViT
+CLS_NUM_LAYERS = 6  # Small ViT depth
+CLS_NUM_HEADS = 3  # Small ViT heads
+CLS_MLP_DIM = 768  # Small ViT FFN dimension
+CLS_PARTITION = 4  # Each 14x14 patch predicts 2x2=4 sub-region change probs
+
+# Primary Predictor (Stage 3) architecture
+PRED_NUM_LAYERS = 6  # Main ViT depth
+PRED_NUM_HEADS = 16  # Main ViT heads
+PRED_MLP_DIM = 2048  # Main ViT FFN dimension
+K_MAX = 32  # Fixed number of foreground tokens after mask processing
+
+# LRM (Stage 4) architecture
+LRM_NUM_HEADS = 4  # Cross-attention heads
+
+# Label generation
+PIXEL_THRESHOLD = 0.1  # Threshold for pixel-diff based GT mask generation
+
+
+# ==============================================================================
+# Utility Functions
+# ==============================================================================
+
+
+def freeze_module(module: nn.Module):
+    """Freeze all parameters in a module and set to eval mode."""
+    if module is None:
+        return
+    module.eval()
+    for param in module.parameters():
+        param.requires_grad = False
+
+
+def dilate_mask_2d(mask: Tensor, connectivity: int = 0) -> Tensor:
+    """
+    Dilate a binary mask on 14x14 grid.
+    Args:
+        mask: (B, 196) float, 0 or 1
+        connectivity: 0=no dilation, 4=cross, 8=square
+    Returns:
+        (B, 196) dilated mask
+    """
+    if connectivity not in [4, 8]:
+        return mask
+
+    b, n = mask.shape
+    if n != N_PATCHES:
+        raise ValueError(f"mask has {n} patches, expected {N_PATCHES}")
+
+    mask_2d = mask.view(b, 1, GRID_SIZE, GRID_SIZE)
+
+    if connectivity == 4:
+        kernel = torch.tensor(
+            [[0, 1, 0], [1, 1, 1], [0, 1, 0]], dtype=mask.dtype, device=mask.device
+        ).view(1, 1, 3, 3)
+    else:
+        kernel = torch.ones(1, 1, 3, 3, dtype=mask.dtype, device=mask.device)
+
+    dilated = F.conv2d(mask_2d, kernel, padding=1)
+    return (dilated > 0).float().view(b, n)
+
+
+def force_fixed_k(mask: Tensor, k: int = K_MAX) -> Tensor:
+    """
+    Adjust mask so each row has exactly k True values.
+    Uses score-based selection: existing True positions get priority.
+    """
+    B, N = mask.shape
+    noise = torch.rand(B, N, device=mask.device)
+    scores = mask.float() * 2.0 + noise  # True positions score 2-3, False score 0-1
+    _, indices = torch.topk(scores, k, dim=1)
+    new_mask = torch.zeros_like(mask, dtype=torch.bool)
+    new_mask.scatter_(1, indices, True)
+    return new_mask
+
+
+# ==============================================================================
+# Building Blocks
+# ==============================================================================
+
+
+class MLP(nn.Module):
+    """Simple multi-layer perceptron."""
+
+    def __init__(self, input_dim: int, hidden_dim: int, output_dim: int, num_layers: int = 3):
+        super().__init__()
+        h = [hidden_dim] * (num_layers - 1)
+        layers = []
+        for n_in, n_out in zip([input_dim] + h, h + [output_dim], strict=False):
+            layers.append(nn.Linear(n_in, n_out))
+            layers.append(nn.ReLU(inplace=True))
+        layers.pop()  # Remove last ReLU
+        self.layers = nn.Sequential(*layers)
+
+    def forward(self, x: Tensor) -> Tensor:
+        return self.layers(x)
+
+
+class CrossAttentionLayer(nn.Module):
+    """Single cross-attention layer with residual and LayerNorm (post-norm)."""
+
+    def __init__(self, d_model: int, nhead: int, dropout: float = 0.1):
+        super().__init__()
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=False)
+        self.norm = nn.LayerNorm(d_model)
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        tgt: Tensor,
+        memory: Tensor,
+        query_pos: Tensor | None = None,
+        key_pos: Tensor | None = None,
+    ) -> Tensor:
+        """
+        Args: All tensors in (L, B, D) format.
+        """
+        q = tgt if query_pos is None else tgt + query_pos
+        k = memory if key_pos is None else memory + key_pos
+        attn_out = self.cross_attn(query=q, key=k, value=memory)[0]
+        tgt = tgt + self.dropout(attn_out)
+        tgt = self.norm(tgt)
+        return tgt
+
+
+class TransformerDecoderLayer(nn.Module):
+    """Standard Transformer decoder layer: self-attn + cross-attn + FFN (post-norm)."""
+
+    def __init__(self, d_model: int, nhead: int, dim_feedforward: int = 2048, dropout: float = 0.1):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=False)
+        self.cross_attn = nn.MultiheadAttention(d_model, nhead, dropout=dropout, batch_first=False)
+        self.linear1 = nn.Linear(d_model, dim_feedforward)
+        self.linear2 = nn.Linear(dim_feedforward, d_model)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.dropout1 = nn.Dropout(dropout)
+        self.dropout2 = nn.Dropout(dropout)
+        self.dropout3 = nn.Dropout(dropout)
+
+    def forward(
+        self,
+        tgt: Tensor,
+        memory: Tensor,
+        query_pos: Tensor | None = None,
+        key_pos: Tensor | None = None,
+    ) -> Tensor:
+        # Self-attention
+        q = k = tgt if query_pos is None else tgt + query_pos
+        sa_out = self.self_attn(q, k, tgt)[0]
+        tgt = tgt + self.dropout1(sa_out)
+        tgt = self.norm1(tgt)
+        # Cross-attention
+        q2 = tgt if query_pos is None else tgt + query_pos
+        k2 = memory if key_pos is None else memory + key_pos
+        ca_out = self.cross_attn(q2, k2, memory)[0]
+        tgt = tgt + self.dropout2(ca_out)
+        tgt = self.norm2(tgt)
+        # FFN
+        ffn_out = self.linear2(self.dropout3(F.relu(self.linear1(tgt))))
+        tgt = tgt + self.dropout3(ffn_out)
+        tgt = self.norm3(tgt)
+        return tgt
+
+
+# ==============================================================================
+# Stage 1: Historical Information Fusion
+# ==============================================================================
+
+
 class HistoricalInformationFusion(nn.Module):
     """
-    paper Stage 1: Historical Information Fusion Module.
-    Use a single layer of Cross-Attention the history frame information (Z_hist) fuse into the current frame (z_t) in.
+    Paper Stage 1: Fuse history frames into current frame via cross-attention.
+    Query = current frame tokens, Key/Value = history frame tokens.
     """
-    def __init__(self, d_model, n_heads, dropout=0.1, num_frames=3, num_patches=196):
-        super().__init__()
-        # Instantiate the cross-attention layer
-        self.history_encoder = CrossAttentionDecoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dropout=dropout,
-            batch_first=False,
-            normalize_before=False
-        )
-        
-        # Instantiate position encoding parameters (These were originally in Predictor 's __init__ in)
-        self.hist_query_pos = nn.Parameter(torch.randn(num_patches, d_model))
-        self.hist_mem_pos = nn.Parameter(torch.randn(num_patches, d_model))
-        if num_frames > 1:
-            self.hist_time_embeds = nn.Parameter(torch.zeros(num_frames - 1, d_model))
-        else:
-            self.hist_time_embeds = None
 
-    def forward(self, z_history: torch.Tensor) -> torch.Tensor:
+    def __init__(
+        self,
+        d_model: int = D_MODEL,
+        nhead: int = 4,
+        num_frames: int = 3,
+        num_patches: int = N_PATCHES,
+        dropout: float = 0.1,
+    ):
+        super().__init__()
+        self.cross_attn = CrossAttentionLayer(d_model, nhead, dropout)
+        self.query_pos = nn.Parameter(torch.randn(num_patches, d_model))
+        self.mem_pos = nn.Parameter(torch.randn(num_patches, d_model))
+        self.time_embeds = (
+            nn.Parameter(torch.zeros(max(num_frames - 1, 1), d_model)) if num_frames > 1 else None
+        )
+
+    def forward(self, z_history: Tensor) -> Tensor:
         """
         Args:
-            z_history (torch.Tensor): the input history sequence, shape [B, T, N, D].
-                                      the last frame is the current frame t, preceded by history frames.
-
+            z_history: (B, T, N, D) - history sequence, last frame is current
         Returns:
-            torch.Tensor: current frame features after fusing history information z_t', shape [B, 1, N, D].
+            z_t_prime: (B, 1, N, D) - current frame with history fused in
         """
-        B, t_len, N, D = z_history.shape
+        B, T, N, D = z_history.shape
 
-        if t_len <= 1:
-            # If there is no history information, return the current frame directly, but ensure the computation graph can pass(for gradient checking)
-            if self.hist_time_embeds is not None:
-                # This is a trick, Ensure that even without history frames, these parameters are also included in the computation graph
-                # Their gradients will be0, but it won't cause an error for being unused
-                dummy_sum = sum(p.sum() for p in self.history_encoder.parameters()) * 0 + \
-                            self.hist_query_pos.sum() * 0 + \
-                            self.hist_mem_pos.sum() * 0 + \
-                            self.hist_time_embeds.sum() * 0
-                return z_history + dummy_sum
-            return z_history
+        if T <= 1:
+            # No history to fuse, ensure params in computation graph
+            dummy = 0
+            if self.time_embeds is not None:
+                dummy = (
+                    self.time_embeds.sum() * 0 + self.query_pos.sum() * 0 + self.mem_pos.sum() * 0
+                )
+            return z_history + dummy
 
-        # prepare Query: current_frame
-        current_frame = z_history[:, -1, :, :].permute(1, 0, 2)  # (N, B, D)
-        query_pos = self.hist_query_pos.unsqueeze(1).repeat(1, B, 1) # (N, B, D)
-        
-        # prepare Key/Value: history_frame
-        history_frames = rearrange(z_history[:, :-1, :, :], 'b t n d -> (t n) b d') # ((t-1)*N, B, D)
-        
-        # prepare Key/Value 's position encoding
-        hist_len = t_len - 1
-        mem_pos_spatial = self.hist_mem_pos.unsqueeze(0).repeat(hist_len, 1, 1) # (t-1, N, D)
-        
-        if self.hist_time_embeds is not None:
-            time_pe = self.hist_time_embeds[:hist_len].unsqueeze(1)
-            mem_pos_full = mem_pos_spatial + time_pe
-        else:
-            mem_pos_full = mem_pos_spatial
-        
-        mem_pos = rearrange(mem_pos_full, 't n d -> (t n) d').unsqueeze(1).repeat(1, B, 1) # ((t-1)*N, B, D)
+        # Current frame as Query: (N, B, D)
+        current = z_history[:, -1].permute(1, 0, 2)
+        q_pos = self.query_pos.unsqueeze(1).expand(-1, B, -1)
 
-        # Execute cross-attention, with an internal residual connection
-        encoded_frame = self.history_encoder(
-            tgt=current_frame,
-            memory=history_frames,
-            query_pos=query_pos,
-            pos=mem_pos
-        )  # (N, B, D)
-        
-        # Restore dimensions and return
-        z_t_prime = encoded_frame.permute(1, 0, 2).unsqueeze(1) # [B, 1, N, D]
-        
-        return z_t_prime
+        # History frames as Key/Value: ((T-1)*N, B, D)
+        history = rearrange(z_history[:, :-1], "b t n d -> (t n) b d")
+
+        # Build memory position with temporal encoding
+        hist_len = T - 1
+        mem_pos_spatial = self.mem_pos.unsqueeze(0).expand(hist_len, -1, -1)  # (T-1, N, D)
+        if self.time_embeds is not None:
+            time_pe = self.time_embeds[:hist_len].unsqueeze(1)  # (T-1, 1, D)
+            mem_pos_spatial = mem_pos_spatial + time_pe
+        mem_pos_flat = rearrange(mem_pos_spatial, "t n d -> (t n) d").unsqueeze(1).expand(-1, B, -1)
+
+        # Cross-attention
+        encoded = self.cross_attn(current, history, query_pos=q_pos, key_pos=mem_pos_flat)
+
+        return encoded.permute(1, 0, 2).unsqueeze(1)  # (B, 1, N, D)
 
 
-# ====================================================================
-#  Stage 2: DynamicLocalizationNetwork (Dynamic Localization Network)
-# ====================================================================
+# ==============================================================================
+# Stage 2: Dynamic Localization Network (Classifier)
+# ==============================================================================
+
+
 class DynamicLocalizationNetwork(nn.Module):
     """
-    paper Stage 2: Dynamic Localization Network.
-    A lightweight ViT, receives the fused z_t' and action, predict the changed region mask M.
+    Paper Stage 2: Lightweight ViT that predicts which patches will change.
+    Predicts 4 sub-region change probabilities per 14x14 patch (= 28x28 resolution).
     """
-    def __init__(self, d_visual, d_action_embed, d_proprio_embed, 
-                 reduced_dim, num_layers, n_heads, mlp_dim, n_patches_hw, partition_precision, **kwargs):
-        super().__init__()
-        self.n_patches_hw = n_patches_hw
-        
-        self.dimensionality_reduction_layer = nn.Linear(d_visual, reduced_dim)
-        
-        dino_wm_ti_dim = reduced_dim + d_action_embed + d_proprio_embed
-        self.dino_wm_ti = ViTPredictor(
-            dim=dino_wm_ti_dim, 
-            depth=num_layers, 
-            heads=n_heads, 
-            mlp_dim=mlp_dim,
-            num_frames=1, 
-            num_patches=n_patches_hw[0] * n_patches_hw[1]
-        )
-        
-        # Determine output dimension based on configuration
-        self.cls_head = MLP(dino_wm_ti_dim, dino_wm_ti_dim, partition_precision, num_layers=3)
 
-    def forward(self, z_t_prime_vis: torch.Tensor, z_t_prime_prio: torch.Tensor, z_t_prime_act: torch.Tensor) -> torch.Tensor:
+    def __init__(
+        self,
+        d_visual: int = D_VISUAL,
+        d_action: int = D_ACTION_EMB,
+        d_proprio: int = D_PROPRIO_EMB,
+        reduced_dim: int = CLS_REDUCED_DIM,
+        num_layers: int = CLS_NUM_LAYERS,
+        num_heads: int = CLS_NUM_HEADS,
+        mlp_dim: int = CLS_MLP_DIM,
+        partition: int = CLS_PARTITION,
+    ):
+        super().__init__()
+        self.dim_reduce = nn.Linear(d_visual, reduced_dim)
+
+        vit_dim = reduced_dim + d_action + d_proprio  # 192 + 10 + 10 = 212
+        self.vit = ViTPredictor(
+            dim=vit_dim,
+            depth=num_layers,
+            heads=num_heads,
+            mlp_dim=mlp_dim,
+            num_frames=1,
+            num_patches=N_PATCHES,
+            dropout=0.1,
+            emb_dropout=0,
+        )
+        self.cls_head = MLP(vit_dim, vit_dim, partition, num_layers=3)
+
+    def forward(self, z_t_prime: Tensor) -> Tensor:
         """
         Args:
-            z_t_prime_vis (torch.Tensor): visual part, shape [B, 1, N, D_vis]
-            z_t_prime_prio (torch.Tensor): proprioceptive part, shape [B, 1, N, D_prio]
-            z_t_prime_act (torch.Tensor): action part, shape [B, 1, N, D_act]
-        
+            z_t_prime: (B, 1, N, D_MODEL) - fused current frame
         Returns:
-            torch.Tensor: mask's logits, shape [B, N*4] or [B, N]
+            logits: (B, N, 4) - per-patch sub-region change logits
         """
-        # as prio and act expand patch dimension
-        B, _, N, _ = z_t_prime_vis.shape
+        vis = z_t_prime[..., :D_VISUAL]  # (B, 1, N, 384)
+        prio = z_t_prime[..., D_VISUAL : D_VISUAL + D_PROPRIO_EMB]  # (B, 1, N, 10)
+        act = z_t_prime[..., -D_ACTION_EMB:]  # (B, 1, N, 10)
 
-        # Dimensionality reduction and concatenation
-        z_vis_reduction = self.dimensionality_reduction_layer(z_t_prime_vis)
-        z_reduction = torch.cat([z_vis_reduction, z_t_prime_prio, z_t_prime_act], dim=-1)
-        
-        # ViT Adjust input format
-        z_reduction = rearrange(z_reduction, "b t p d -> b (t p) d")
-        
-        # through ViT and classification head
-        z_reduction = self.dino_wm_ti(z_reduction)
-        logits = self.cls_head(z_reduction)
-        
+        vis_reduced = self.dim_reduce(vis)  # (B, 1, N, 192)
+        x = torch.cat([vis_reduced, prio, act], dim=-1)  # (B, 1, N, 212)
+        x = rearrange(x, "b t n d -> b (t n) d")  # (B, N, 212)
+        x = self.vit(x)  # (B, N, 212)
+        logits = self.cls_head(x)  # (B, N, 4)
         return logits
 
 
+# ==============================================================================
+# Stage 3: Sparse Primary Dynamics Predictor
+# ==============================================================================
 
-# ====================================================================
-#  Stage 3: SparsePrimaryDynamicsPredictor (Sparse Primary Dynamics Predictor)
-# ====================================================================
-class SparsePrimaryDynamicsPredictor(nn.Module):
+
+class SparsePrimaryPredictor(nn.Module):
     """
-    paper Stage 3: Sparse Primary Dynamics Predictor.
-    A powerful Transformer, on the localized sparse foreground token perform self-attention on.
+    Paper Stage 3: Full-power ViT that processes ONLY foreground tokens.
+    Uses ViTPredictor with masking to achieve sparse computation.
     """
-    def __init__(self, d_model, num_layers, n_heads, mlp_dim, **kwargs):
+
+    def __init__(
+        self,
+        d_model: int = D_MODEL,
+        num_layers: int = PRED_NUM_LAYERS,
+        num_heads: int = PRED_NUM_HEADS,
+        mlp_dim: int = PRED_MLP_DIM,
+    ):
         super().__init__()
-        # Used here ViTPredictor, because it is essentially a token operating on the sequence Transformer
-        self.dino_wm = ViTPredictor(
-            dim=d_model, 
-            depth=num_layers, 
-            heads=n_heads, 
+        self.vit = ViTPredictor(
+            dim=d_model,
+            depth=num_layers,
+            heads=num_heads,
             mlp_dim=mlp_dim,
-            num_frames=1, # Only process the foreground of a single frame
-            num_patches=196 
+            num_frames=1,
+            num_patches=N_PATCHES,
+            dropout=0.1,
+            emb_dropout=0,
         )
 
-    def forward(self, z_t_prime: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+        # === Hungarian-matching heads of the reference pipeline ===
+        # This reproduction does not use the Hungarian loss, so nothing consumes pred_coords /
+        # pred_cls: these two heads get no gradient in any stage and are kept only so that a
+        # checkpoint of the reference implementation still loads key-for-key. They are frozen here
+        # (and therefore never enter the optimizer) so that "trainable parameters" means what it
+        # says; the evaluation's completeness check skips them for the same reason.
+        self.coord_head = nn.Sequential(
+            nn.Linear(d_model, 128),
+            nn.ReLU(),
+            nn.Linear(128, 2),
+            nn.Sigmoid(),  # Output normalized [0,1] coordinates
+        )
+        self.cls_head_pred = nn.Sequential(nn.Linear(d_model, 128), nn.ReLU(), nn.Linear(128, 1))
+        for head in (self.coord_head, self.cls_head_pred):
+            freeze_module(head)
+
+    def forward(self, z_t_prime: Tensor, mask: Tensor) -> Tensor:
         """
         Args:
-            z_t_prime (torch.Tensor): fused current frame, shape [B, 1, N, D_model].
-            mask (torch.Tensor): boolean mask, shape [B, N], True represents foreground.
-
+            z_t_prime: (B, N, D_MODEL) - fused current frame (squeezed)
+            mask: (B, N) boolean - True = foreground
         Returns:
-            torch.Tensor: the predicted foreground features of the next frame, shape [B, K, D_model].
+            pred_fg: (B, K, D_MODEL) - predicted foreground features
         """
-        B, _, N, D = z_t_prime.shape
-        z_t_prime = z_t_prime.squeeze(1)
+        # ViTPredictor with mask: processes only True tokens
+        pred_fg = self.vit(z_t_prime, mask)  # (B, K, D)
+        pred_coords = self.coord_head(pred_fg)  # (B, K, 2)
+        pred_cls = self.cls_head_pred(pred_fg).squeeze(-1)  # (B, K)
+        return pred_fg, pred_coords, pred_cls
 
-        # Perform self-attention through the primary predictor
-        # dino_wm input [B, N, D], output [B, K, D]
-        next_fg_tokens = self.dino_wm(z_t_prime, mask)
-   
-        return next_fg_tokens
 
-        
-# ====================================================================
-#  Stage 4: LowRankCorrectionModule (LRM / Low-Rank Correction Module)
-# ====================================================================
+# ==============================================================================
+# Stage 4: Low-Rank Correction Module (LRM)
+# ==============================================================================
+
+
 class LowRankCorrectionModule(nn.Module):
     """
-    paper Stage 4: Low-Rank Correction Module (LRM).
-
-    This module is responsible for efficiently updating background features.Its core mechanism is:
-    1. background token as Query.
-    2. the updated foreground token as Key and Value.
-    3. Through a single cross-attention layer, Let each background token "query" changes in the foreground, and adjust itself accordingly.
-    4. Use Absolute Position Encoding (APE) as Query and Key/Value provide spatial information.
+    Paper Stage 4: Single cross-attention layer.
+    Background tokens (Query) attend to predicted foreground tokens (Key/Value).
+    Uses learnable APE assigned by mask to provide spatial information.
     """
-    def __init__(self, d_model: int, n_heads: int, n_patches: int, dropout: float = 0.0):
-        """
-        initialize LRM module.
 
-        Args:
-            d_model (int): The feature dimension of the model.
-            n_heads (int): The number of heads for multi-head attention.
-            n_patches (int): patch 's total count (for example 14*14=196).
-            dropout (float): Dropout 's probability.
-        """
+    def __init__(
+        self,
+        d_model: int = D_MODEL,
+        nhead: int = LRM_NUM_HEADS,
+        n_patches: int = N_PATCHES,
+        dropout: float = 0.0,
+    ):
         super().__init__()
-        self.d_model = d_model
-        self.n_patches = n_patches
-
-        # 1. Directly instantiate the cross-attention layer
-        self.cross_attn = CrossAttentionDecoderLayer(
-            d_model=d_model,
-            nhead=n_heads,
-            dropout=dropout,
-            batch_first=False,  # PyTorch Transformerlayer expects by default (L, B, D)
-            normalize_before=False
-        )
-
-        # 2. Create learnable Absolute Position Encoding (APE)
-        #    thisAPEwill be used for all 196  patch provide position information
         self.ape = nn.Parameter(torch.randn(n_patches, d_model))
+        self.cross_attn = CrossAttentionLayer(d_model, nhead, dropout)
 
     @staticmethod
-    def _mask_to_indices(mem_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        A static helper function, convert a boolean mask into foreground and background indices.
+    def mask_to_indices(mask: Tensor) -> tuple[Tensor, Tensor]:
+        """Split mask into foreground and background indices."""
+        if mask.dtype != torch.bool:
+            mask = mask > 0.5
+        B, N = mask.shape
+        pos = torch.arange(N, device=mask.device).unsqueeze(0).expand(B, -1)
+        idx_fg = pos[mask].view(B, -1)
+        idx_bg = pos[~mask].view(B, -1)
+        return idx_fg, idx_bg
 
+    def forward(self, z_t_prime: Tensor, mask: Tensor, pred_fg: Tensor) -> Tensor:
+        """
         Args:
-            mem_mask (torch.Tensor): foreground mask, shape [B, N], Truerepresents foreground.
-
+            z_t_prime: (B, N, D) - current frame features
+            mask: (B, N) boolean - True = foreground
+            pred_fg: (B, K, D) - predicted next-frame foreground features
         Returns:
-            Tuple[torch.Tensor, torch.Tensor]: (foreground index, background index).
-        """
-        B, N = mem_mask.shape
-        device = mem_mask.device
-        
-        # Create a grid containing all position indices
-        pos = torch.arange(N, device=device).unsqueeze(0).expand(B, -1)  # (B, N)
-
-        # Separate indices based on the mask
-        idx_mem = pos[mem_mask].view(B, -1)     # (B, K)
-        idx_tgt = pos[~mem_mask].view(B, -1)   # (B, N-K)
-        
-        return idx_mem, idx_tgt
-
-    def forward(self, z_t_prime: torch.Tensor, mask: torch.Tensor, pred_fg_tokens: torch.Tensor) -> torch.Tensor:
-        """
-        execute LRM 's forward propagation.
-
-        Args:
-            z_t_prime (torch.Tensor): fused current frame features, shape [B, N, D].
-            mask (torch.Tensor): boolean mask, shape [B, N], True represents foreground.
-            pred_fg_tokens (torch.Tensor): the predicted foreground features of the next frame, shape [B, K, D].
-
-        Returns:
-            torch.Tensor: updated next-frame background features, shape [B, N-K, D].
+            updated_bg: (B, N-K, D) - updated background features
         """
         B, N, D = z_t_prime.shape
-        K = pred_fg_tokens.shape[1]
+        K = pred_fg.shape[1]
         num_bg = N - K
-        
-        # 1. Extract original background token (as Query)
+
+        # Extract background tokens
         bg_tokens = z_t_prime[~mask].view(B, num_bg, D)
-        
-        # 2. Prepare inputs for cross-attention (tgt, memory, pos, query_pos)
-        
-        # 2a. Get foreground and background indices
-        idx_mem, idx_tgt = self._mask_to_indices(mask)
-        
-        # 2b. Assign position encodings
-        #    - `pos` is memory (foreground) 's position encoding
-        #    - `query_pos` is tgt (background) 's position encoding
-        ape_mem = self.ape.index_select(0, idx_mem.reshape(-1)).view(B, K, D)
-        ape_bg = self.ape.index_select(0, idx_tgt.reshape(-1)).view(B, num_bg, D)
-        
-        # 2c. Adjust dimensions to match PyTorch Transformer API (L, B, D)
-        # Query (background)
-        tgt = bg_tokens.transpose(0, 1)          # (N-K, B, D)
-        query_pos = ape_bg.transpose(0, 1)       # (N-K, B, D)
-        
-        # Key/Value (foreground)
-        memory = pred_fg_tokens.transpose(0, 1)  # (K, B, D)
-        pos = ape_mem.transpose(0, 1)            # (K, B, D)
-        
-        # 3. Execute cross-attention
-        #    background(tgt)query foreground(memory)
-        updated_bg_tokens_transposed = self.cross_attn(
-            tgt=tgt,
-            memory=memory,
-            pos=pos,
-            query_pos=query_pos
-        )
-        
-        # 4. Restore dimensions to (B, N-K, D) and return
-        updated_bg_tokens = updated_bg_tokens_transposed.transpose(0, 1)
-        
-        return updated_bg_tokens
+
+        # Get position indices
+        idx_fg, idx_bg = self.mask_to_indices(mask)
+
+        # Assign APE by mask
+        ape_fg = self.ape.index_select(0, idx_fg.reshape(-1)).view(B, K, D)
+        ape_bg = self.ape.index_select(0, idx_bg.reshape(-1)).view(B, num_bg, D)
+
+        # Cross-attention: BG queries FG (L, B, D format)
+        tgt = bg_tokens.transpose(0, 1)  # (N-K, B, D)
+        mem = pred_fg.transpose(0, 1)  # (K, B, D)
+        q_pos = ape_bg.transpose(0, 1)  # (N-K, B, D)
+        k_pos = ape_fg.transpose(0, 1)  # (K, B, D)
+
+        updated = self.cross_attn(tgt, mem, query_pos=q_pos, key_pos=k_pos)
+        return updated.transpose(0, 1)  # (B, N-K, D)
 
 
-# ====================================================================
-#  Final Assembly: DDP-WM predictor
-# ====================================================================
-class DDP_Predictor(nn.Module):
-    """
-    complete DDP-WM predictor, Supports staged initialization and training.
-    through `training_stage` parameter controls the instantiation and forward propagation logic of the module.
-    """
-    def __init__(self, d_visual, d_action_embed, d_proprio_embed, num_frames, num_patches, 
-                 training_stage: str = 'inference', **kwargs):
-        """
-        Args:
-            training_stage (str): training stage, optional_values:
-                - 'localization': Train only history fusion and localization network.
-                - 'primary_predictor': Train the Primary Dynamics Predictor (Freeze preceding modules).
-                - 'lrm': Train the Low-Rank Correction Module (Freeze preceding modules).
-                - 'inference': inference mode, All modules are loaded and frozen.
-        """
-        super().__init__()
-        
-        # --- 1. Save core configuration ---
-        self.d_visual = d_visual
-        self.d_proprio = d_proprio_embed
-        self.d_action = d_action_embed
-        self.training_stage = training_stage
-        
-        d_model = d_visual + d_action_embed + d_proprio_embed
-        n_patches_hw = (int(num_patches**0.5), int(num_patches**0.5))
-
-        # --- 2. According to the training stage, Conditionally initialize modules as needed ---
-        
-        # All modules are by default None
-        self.history_fusion: Optional[HistoricalInformationFusion] = None
-        self.localizer: Optional[DynamicLocalizationNetwork] = None
-        self.primary_predictor: Optional[SparsePrimaryDynamicsPredictor] = None
-        self.lrm: Optional[LowRankCorrectionModule] = None
-        self.delta_head: Optional[MLP] = None
-        
-        print(f"Initializing DDP_Predictor in '{self.training_stage}' stage.")
-
-        # Stage 1 & 2: Always required or as a dependency
-        if self.training_stage in ['localization', 'primary_predictor', 'lrm', 'inference']:
-            self.history_fusion = HistoricalInformationFusion(
-                d_model=d_model, num_frames=num_frames, num_patches=num_patches, **kwargs['history_fusion']
-            )
-            self.localizer = DynamicLocalizationNetwork(
-                d_visual=d_visual, d_action_embed=d_action_embed, d_proprio_embed=d_proprio_embed,
-                n_patches_hw=n_patches_hw, **kwargs['localizer']
-            )
-
-        # Stage 3: at 'primary_predictor' and subsequent stages require
-        if self.training_stage in ['primary_predictor', 'lrm', 'inference']:
-            self.primary_predictor = SparsePrimaryDynamicsPredictor(
-                d_model=d_model, **kwargs['primary_predictor']
-            )
-        
-        # Stage 4: at 'lrm' and subsequent stages require
-        if self.training_stage in ['lrm', 'inference']:
-            self.lrm = LowRankCorrectionModule(
-                d_model=d_model, n_patches=num_patches, **kwargs['lrm']
-            )
-        
-        # --- 3. Freeze pre-trained modules according to the stage ---
-        self._freeze_stages()
-
-    def _freeze_stages(self):
-        """According to the current training stage, Freeze modules that do not need to be trained."""
-        if self.training_stage == 'primary_predictor':
-            print("Freezing modules for 'primary_predictor' stage...")
-            freeze_module(self.history_fusion)
-            freeze_module(self.localizer)
-        
-        elif self.training_stage == 'lrm':
-            print("Freezing modules for 'lrm' stage...")
-            freeze_module(self.history_fusion)
-            freeze_module(self.localizer)
-            freeze_module(self.primary_predictor)
-
-        elif self.training_stage == 'inference':
-            print("Freezing all modules for 'inference' stage.")
-            freeze_module(self) # Freeze all its own parameters
-
-    def _process_mask(self, mask_logits: torch.Tensor) -> torch.Tensor:
-        """Internal helper function, used tologitsconvert to the final binarized mask."""
-        mask = (mask_logits.sigmoid() > 0.5)
-        if len(mask.shape) == 3: # Handle multi-class output cases
-            mask = mask.sum(-1) > 0
-        # mask = dilate_mask(mask, connectivity=connectivity)
-        mask = force_fixed_k_mask(mask)
-        return mask
-
-    def forward(self, z_history: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """
-        executed in stagesDDP-WMforward propagation.
-        according to `self.training_stage` return different intermediate results.
-        """
-        # --- Stage 1: History Fusion ---
-        # This step is always needed, even if it is primary_predictor stage, also needs it as no_grad 's input
-        with torch.no_grad() if self.training_stage not in ['localization'] else torch.enable_grad():
-            z_t_prime_full = self.history_fusion(z_history) # [B, 1, N, D]
-        
-        # --- Stage 2: Dynamic Localization ---
-        with torch.no_grad() if self.training_stage not in ['localization'] else torch.enable_grad():
-            z_vis = z_t_prime_full[..., :self.d_visual]
-            z_prio = z_t_prime_full[..., self.d_visual : self.d_visual + self.d_proprio]
-            z_act = z_t_prime_full[..., -self.d_action:]
-            mask_logits = self.localizer(z_vis, z_prio, z_act)
-        
-        if self.training_stage == 'localization':
-            return {'mask_logits': mask_logits}
-
-        # --- Stage 3: Sparse Primary Dynamics Prediction ---
-        with torch.no_grad() if self.training_stage not in ['primary_predictor'] else torch.enable_grad():
-            mask = self._process_mask(mask_logits)
-            pred_fg_tokens = self.primary_predictor(z_t_prime_full, mask)
-        
-        if self.training_stage == 'primary_predictor':
-            return {'pred_fg': pred_fg_tokens, 'mask': mask}
-
-        # --- Stage 4: Low-Rank Correction ---
-        with torch.no_grad() if self.training_stage not in ['lrm'] else torch.enable_grad():
-            updated_bg_tokens = self.lrm(z_t_prime_full.squeeze(1), mask, pred_fg_tokens)
-
-        if self.training_stage == 'lrm':
-            return {'pred_bg': updated_bg_tokens, 'mask': mask}
-        
-        # --- Combine foreground and background, form the next frame ---
-        z_t_plus_1 = torch.zeros_like(z_history[:,-1])
-        z_t_plus_1[mask] = pred_fg_tokens.view(-1, z_t_prime_full.size(-1))
-        z_t_plus_1[~mask] = updated_bg_tokens.view(-1, z_t_prime_full.size(-1))
-
-        # --- Inference stage ---
-        return {'final_prediction': z_t_plus_1.unsqueeze(1)}
-
+# ==============================================================================
+# Label Generator: Creates GT masks from pixel differences
+# ==============================================================================
 
 
 class LabelGenerator(nn.Module):
     """
-    A module specifically for generating binarized foreground masks from raw data during training.
-
-    This module, based on the specified mode ('pixel' or 'feature') calculate the change between consecutive frames, 
-    Apply threshold, finally generate a
-    clean、for supervising downstream tasks(like localization、segmentation)'s boolean mask.
-
-    It does not participate in the model's inference process.
-
-    Args:
-        mode (str): 'pixel' or 'feature'.Determines whether to generate the mask based on pixel difference or feature difference.
-        pixel_threshold (float): at 'pixel' in mode, The pixel difference norm threshold used to determine significant changes.
-        feature_threshold (float): at 'feature' in mode, The feature difference norm threshold used to determine significant changes.
-        d_feature (int): at 'feature' in mode, The feature dimension used to calculate the norm.
-        grid_h (int): feature_map/of the mask in the height direction patch count.
-        grid_w (int): feature_map/of the mask in the width direction patch count.
+    Generates binary foreground masks from pixel-level frame differences.
+    Used as GT supervision for the classifier (Stage 2).
+    Not trainable - purely deterministic.
     """
-    def __init__(self,
-                 mode: Literal['pixel', 'feature'] = 'pixel',
-                 pixel_threshold: float = 0.1,
-                 feature_threshold: float = 45.0,
-                 d_feature: int = 384,
-                 grid_h: int = 14,
-                 grid_w: int = 14,
-                 partition_precision: int = 4,
-                 **kwargs): # Absorb extra configuration parameters
-        super().__init__()
 
-        assert mode in ['pixel', 'feature'], "mode must be 'pixel' or 'feature'"
-        
-        self.mode = mode
-        self.pixel_threshold = pixel_threshold
-        self.feature_threshold = feature_threshold
-        self.d_feature = d_feature
+    def __init__(
+        self,
+        threshold: float = PIXEL_THRESHOLD,
+        grid_h: int = GRID_SIZE,
+        grid_w: int = GRID_SIZE,
+        partition: int = CLS_PARTITION,
+    ):
+        super().__init__()
+        self.threshold = threshold
         self.grid_h = grid_h
         self.grid_w = grid_w
-        self.n_patches = grid_h * grid_w
-        self.partition_precision = partition_precision
-
-        # set the module to evaluation mode and freeze it, because it does not contain trainable parameters
+        self.partition = partition  # 4 = 2x2 sub-patches
         self.eval()
-        for param in self.parameters():
-            param.requires_grad = False
+        for p in self.parameters():
+            p.requires_grad = False
 
     @torch.no_grad()
-    def forward(self, 
-                images_dict: Dict[str, torch.Tensor],
-                z_dict: Dict[str, torch.Tensor]) -> torch.Tensor:
+    def forward(self, frames_current: Tensor, frames_next: Tensor) -> Tensor:
         """
-        Generate a foreground mask based on the input data.
+        Args:
+            frames_current: (B, C, H, W) - current frame images (after encoder_transform)
+            frames_next: (B, C, H, W) - next frame images
+        Returns:
+            gt_mask: (B, N, 4) float - per sub-patch binary labels (0/1)
+        """
+        B, C, H, W = frames_current.shape
+        pixel_diff = frames_next - frames_current  # (B, C, H, W)
+
+        # Pixel L2 norm squared
+        norms_sq = torch.sum(pixel_diff**2, dim=1, keepdim=True)  # (B, 1, H, W)
+
+        # Pool to sub-patch resolution (28x28 for partition=4 on 14x14 grid)
+        sub_h = int(math.sqrt(self.partition))  # 2
+        patch_h = H // (self.grid_h * sub_h)
+        patch_w = W // (self.grid_w * sub_h)
+
+        pooled = F.avg_pool2d(norms_sq, kernel_size=(patch_h, patch_w), stride=(patch_h, patch_w))
+        # pooled: (B, 1, grid_h*2, grid_w*2) = (B, 1, 28, 28)
+
+        rms = torch.sqrt(pooled).squeeze(1)  # (B, 28, 28)
+        binary = (rms > self.threshold).float()  # (B, 28, 28)
+
+        # Reshape to (B, N, 4): group 2x2 sub-patches per parent patch
+        # (B, 28, 28) -> (B, 14, 2, 14, 2) -> (B, 14, 14, 2, 2) -> (B, 196, 4)
+        gt_mask = rearrange(
+            binary,
+            "b (h p1) (w p2) -> b (h w) (p1 p2)",
+            h=self.grid_h,
+            w=self.grid_w,
+            p1=sub_h,
+            p2=sub_h,
+        )
+        return gt_mask
+
+
+# ==============================================================================
+# Main Assembly: DDP_Predictor
+# ==============================================================================
+
+
+class DDP_Predictor(nn.Module):
+    """
+    Complete DDP-WM predictor with staged training support.
+
+    Args:
+        training_stage: One of 'classifier', 'predictor', 'lrm', 'inference'
+        classifier_ckpt: Path to trained classifier checkpoint (for stages after classifier)
+        predictor_ckpt: Path to trained primary predictor checkpoint (for lrm stage)
+    """
+
+    def __init__(
+        self,
+        training_stage: Literal["classifier", "predictor", "lrm", "inference"] = "classifier",
+        classifier_ckpt: str | None = None,
+        predictor_ckpt: str | None = None,
+    ):
+        super().__init__()
+        self.training_stage = training_stage
+
+        log.info(f"[DDP_Predictor] Initializing in '{training_stage}' stage")
+
+        # --- Always create Stage 1 + 2 (needed by all stages) ---
+        # history_fusion always uses num_frames=3 (its internal context window)
+        # regardless of the overall num_hist setting (which affects data window for rollout)
+        HISTORY_FUSION_FRAMES = 3
+        self.history_fusion = HistoricalInformationFusion(
+            d_model=D_MODEL, nhead=4, num_frames=HISTORY_FUSION_FRAMES, num_patches=N_PATCHES
+        )
+        self.localizer = DynamicLocalizationNetwork()
+        self.label_generator = LabelGenerator()
+
+        # --- Stage 3: needed for predictor, lrm, inference ---
+        self.primary_predictor: SparsePrimaryPredictor | None = None
+        if training_stage in ["predictor", "lrm", "inference"]:
+            self.primary_predictor = SparsePrimaryPredictor()
+
+        # --- Stage 4: needed for lrm, inference ---
+        self.lrm: LowRankCorrectionModule | None = None
+        if training_stage in ["lrm", "inference"]:
+            self.lrm = LowRankCorrectionModule()
+
+        # --- Load pre-trained weights ---
+        if training_stage in ["predictor", "lrm", "inference"] and classifier_ckpt:
+            self._load_classifier(classifier_ckpt)
+
+        if training_stage in ["lrm", "inference"] and predictor_ckpt:
+            self._load_predictor(predictor_ckpt)
+
+        # --- Freeze stages that should not be trained ---
+        self._freeze_stages()
+
+    def _load_classifier(self, ckpt_path: str):
+        """Load trained classifier (history_fusion + localizer) weights.
+
+        Only the current checkpoint layout is accepted: the tensors are already prefixed with
+        'history_fusion.' / 'localizer.'. Legacy layouts raise, convert them offline first
+        (see third_party/README.md).
+        """
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Classifier checkpoint not found: {ckpt_path}")
+        ckpt = load_checkpoint(ckpt_path)
+        if "predictor" in ckpt:
+            state = ckpt["predictor"]
+        else:
+            state = ckpt
+
+        # Only the current checkpoint layout is supported (legacy keys raise, see models/ckpt_layout.py).
+        assert_current_layout(state, ckpt_path, source="DDP_Predictor")
+
+        own_state = self.state_dict()
+        loaded = 0
+        for k, v in state.items():
+            if k.startswith(("history_fusion.", "localizer.")):
+                if k in own_state and own_state[k].shape == v.shape:
+                    own_state[k].copy_(v)
+                    loaded += 1
+        log.info(f"[DDP_Predictor] Loaded {loaded} classifier params from {ckpt_path}")
+
+    def _load_predictor(self, ckpt_path: str):
+        """Load trained primary predictor weights (includes classifier + primary_predictor)."""
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"Predictor checkpoint not found: {ckpt_path}")
+        ckpt = load_checkpoint(ckpt_path)
+        if "predictor" in ckpt:
+            state = ckpt["predictor"]
+        else:
+            state = ckpt
+        own_state = self.state_dict()
+        loaded = 0
+        for k, v in state.items():
+            if k.startswith(("history_fusion.", "localizer.", "primary_predictor.")):
+                if k in own_state:
+                    own_state[k].copy_(v)
+                    loaded += 1
+        log.info(f"[DDP_Predictor] Loaded {loaded} predictor parameters from {ckpt_path}")
+
+    def _freeze_stages(self):
+        """Freeze modules based on training stage."""
+        if self.training_stage == "classifier":
+            pass  # Train everything (history_fusion + localizer)
+
+        elif self.training_stage == "predictor":
+            freeze_module(self.history_fusion)
+            freeze_module(self.localizer)
+            log.info("[DDP_Predictor] Frozen: history_fusion, localizer")
+
+        elif self.training_stage == "lrm":
+            freeze_module(self.history_fusion)
+            freeze_module(self.localizer)
+            freeze_module(self.primary_predictor)
+            log.info("[DDP_Predictor] Frozen: history_fusion, localizer, primary_predictor")
+
+        elif self.training_stage == "inference":
+            freeze_module(self)
+            log.info("[DDP_Predictor] Frozen: ALL modules")
+
+    def train(self, mode: bool = True):
+        """Keep the frozen classifier in eval() mode, as the old code did.
+
+        Old MotionPredictor overrode train() with `super().train(False)`, so during the
+        predictor / LRM stages the classifier ran with dropout DISABLED while the shared history
+        fusion and the predictor ViT ran in train mode. A plain nn.Module.train() would switch the
+        (frozen) localizer back to train and re-enable its dropout, which changes the sampled
+        foreground mask during training (and is a train/eval mismatch at inference time).
+        """
+        super().train(mode)
+        if self.training_stage != "classifier" and self.localizer is not None:
+            self.localizer.eval()
+        return self
+
+    def _process_mask(self, logits: Tensor) -> Tensor:
+        """Convert classifier logits to binary mask (B, N)."""
+        # logits: (B, N, 4) - sigmoid > 0.5 per sub-region, any active = patch active
+        probs = logits.sigmoid()
+        patch_active = (
+            (probs > 0.5).float().sum(dim=-1)
+        )  # 0-4 sub-region count, matching old code  # (B, N)
+        # No dilation for PushT (the paper uses connectivity=0, i.e. no mask dilation)
+        mask = force_fixed_k(patch_active, k=K_MAX)
+        return mask  # (B, N) bool
+
+    def _process_mask_from_active(self, patch_active: Tensor) -> Tensor:
+        """Same as _process_mask but starting from an already-computed (B, N) activity map.
+
+        Used by the GT-filled rollout, which mirrors the reference ``tools._infer()``:
+        activity -> force_fixed_k(32).
+        """
+        return force_fixed_k(patch_active, k=K_MAX)
+
+    def forward(
+        self,
+        z_history: Tensor,
+        images_current: Tensor | None = None,
+        images_next: Tensor | None = None,
+    ) -> dict[str, Tensor]:
+        """
+        Forward pass with stage-dependent outputs.
 
         Args:
-            images_dict (Dict): a dictionary, should contain 'current' and 'next' key, 
-                               corresponds to t and t+1 's image tensor at time.
-                               Shape: [B, C, H, W].
-            z_dict (Dict): a dictionary, should contain 'current' and 'next' key, 
-                           corresponds to t and t+1 's feature tensor at time.
-                           Shape: [B, N, D].
+            z_history: (B, T, N, D_MODEL) - encoded feature sequence
+            images_current: (B, C, H, W) - for GT mask generation (classifier training)
+            images_next: (B, C, H, W) - for GT mask generation (classifier training)
 
         Returns:
-            torch.Tensor: the final foreground mask M_final, shape [B, N], dtype=torch.bool.
+            Dict with stage-dependent keys:
+              classifier stage: {'mask_logits', 'gt_mask'}
+              predictor stage: {'pred_fg', 'mask', 'gt_fg'}
+              lrm stage: {'pred_bg', 'mask', 'gt_bg'}
+              inference stage: {'prediction'}  (B, 1, N, D_MODEL)
         """
-        B = images_dict['current'].shape[0]
-        device = images_dict['current'].device
+        # --- Stage 1: History Fusion ---
+        # history_fusion is designed for exactly 3 frames (2 history + 1 current).
+        # If z_history has more frames (e.g., from rollout with num_hist=5),
+        # only take the last 3 to match time_embeds dimension.
+        FUSION_CONTEXT = 3
+        z_for_fusion = (
+            z_history[:, -FUSION_CONTEXT:] if z_history.shape[1] > FUSION_CONTEXT else z_history
+        )
 
-        # --- step A: Calculate the original change norm map (Norm Map) ---
-        if self.mode == 'pixel':
-            images_current = images_dict['current']
-            images_next = images_dict['next']
-            
-            # Calculate pixel difference
-            pixel_diff = images_next - images_current  # shape: [B, C, H, W]
+        with torch.no_grad() if self.training_stage != "classifier" else torch.enable_grad():
+            z_t_prime = self.history_fusion(z_for_fusion)  # (B, 1, N, D)
 
-            # Calculate for each pixel L2 the square of the norm (sum over the channel dimension)
-            pixel_norms_sq = torch.sum(pixel_diff.pow(2), dim=1, keepdim=True) # shape: [B, 1, H, W]
+        # --- Stage 2: Dynamic Localization ---
+        with torch.no_grad() if self.training_stage != "classifier" else torch.enable_grad():
+            mask_logits = self.localizer(z_t_prime)  # (B, N, 4)
 
-            # aggregate pixel-level differences to the patch-level using average pooling patch level
-            patch_size_h = images_current.shape[2] // self.grid_h // int(math.sqrt(self.partition_precision))
-            patch_size_w = images_current.shape[3] // self.grid_w // int(math.sqrt(self.partition_precision))
-            pool_kernel = (patch_size_h, patch_size_w)
+        if self.training_stage == "classifier":
+            # Generate GT mask for supervision
+            gt_mask = None
+            if images_current is not None and images_next is not None:
+                gt_mask = self.label_generator(images_current, images_next)  # (B, N, 4)
+            return {"mask_logits": mask_logits, "gt_mask": gt_mask}
 
-            patch_norms_sq = F.avg_pool2d(
-                pixel_norms_sq, 
-                kernel_size=pool_kernel, 
-                stride=pool_kernel
-            ) # shape: [B, 1, grid_h, grid_w]
+        # --- Process mask for downstream stages ---
+        mask = self._process_mask(mask_logits)  # (B, N) bool
 
-            # take the square root and flatten, get for each patch 's RMS norm
-            norms = torch.sqrt(patch_norms_sq).view(B, self.n_patches, -1) # shape: [B, N, _]
-            threshold = self.pixel_threshold
+        # --- Stage 3: Sparse Primary Dynamics Prediction ---
+        # Predictor uses history-fused features when available.
+        # Matches old code (MotionPredictor/DETRStylePredictor) where z_history
+        # is overwritten by fusion output before reaching theViT.
+        # - T=1: fusion returns identity → z_t_prime = raw features (no change)
+        # - T>1: fusion applies cross-attention → z_t_prime = fused features
+        # This gives the ViT temporal context for better h2+ predictions.
+        z_current = z_t_prime.squeeze(1)  # (B, N, D) - fused features (raw when T=1)
 
-        elif self.mode == 'feature':
-            z_current = z_dict['current']
-            z_next = z_dict['next']
-            
-            # Calculate feature difference
-            delta_z = z_next - z_current # shape: [B, N, D]
-            
-            # Calculate the feature difference's L2 norm
-            norms = torch.norm(delta_z[..., :self.d_feature], p=2, dim=-1).view(B, self.n_patches, -1) # shape: [B, N, _]
-            threshold = self.feature_threshold
-        
-        else:
-            raise ValueError(f"unknown mode: {self.mode}")
+        with torch.no_grad() if self.training_stage == "lrm" else torch.enable_grad():
+            # The ViT sees only the K=32 classifier-masked foreground tokens.
+            pred_fg, pred_coords, pred_cls = self.primary_predictor(
+                z_current, mask
+            )  # (B,K,D), (B,K,2), (B,K)
 
-        # --- step B: Apply threshold ---
-        
-        # 1. Apply threshold, obtain the original binary mask
-        M_final = (norms > threshold) # shape: [B, N], dtype=torch.bool
+        if self.training_stage == "predictor":
+            # GT: extract foreground features from next frame (provided externally)
+            return {
+                "pred_fg": pred_fg,
+                "pred_coords": pred_coords,
+                "pred_cls": pred_cls,
+                "mask": mask,
+                "z_current": z_current,
+            }
 
-        return M_final
+        # --- Stage 4: Low-Rank Correction ---
+        updated_bg = self.lrm(z_current, mask, pred_fg)  # (B, N-K, D)
+
+        if self.training_stage == "lrm":
+            return {"pred_bg": updated_bg, "pred_fg": pred_fg, "mask": mask, "z_current": z_current}
+
+        # --- Inference: Combine foreground and background ---
+        z_next = torch.zeros_like(z_current)
+        z_next[mask] = pred_fg.reshape(-1, D_MODEL)
+        z_next[~mask] = updated_bg.reshape(-1, D_MODEL)
+
+        return {"prediction": z_next.unsqueeze(1)}  # (B, 1, N, D)

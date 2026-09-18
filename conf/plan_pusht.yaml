@@ -1,56 +1,113 @@
+# ============================================================================
+# PushT planning/evaluation configuration (hydra config_name for
+# `python -m dino_planning.plan`).
+#
+# Put every evaluation in its own directory so runs stay comparable and nothing is
+# overwritten, e.g.:
+#
+#     python -m dino_planning.plan ddpwm_ckpt=<ckpt> seed=99 n_evals=50 \
+#         use_sparse_cost=true eval_dir=<dir> hydra.run.dir=<dir>
+#
+# (Our own seed sweeps are driven by internal scripts that are not part of this repository.)
+#
+# Anything that changes per evaluation is intentionally left without a default and
+# must be passed on the command line (so nobody silently evaluates the wrong weights):
+#     ddpwm_ckpt=<path>            (required)
+#     seed=<int>  n_evals=<int>  data_path=<path>
+#     eval_dir=<path>  hydra.run.dir=<path>   (filled in by run_eval.sh)
+# ============================================================================
 defaults:
   - _self_
-  - override hydra/launcher: submitit_slurm
 
-hydra:
-  run:
-    dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_gH${goal_H}
-  sweep:
-    dir: plan_outputs/${now:%Y%m%d%H%M%S}_${replace_slash:${model_name}}_gH${goal_H}
-    subdir: ${hydra.job.num}
-  launcher:
-    submitit_folder: ${hydra.sweep.dir}/.submitit/%j
-    nodes: 1
-    tasks_per_node: 1
-    cpus_per_task: 16
-    mem_gb: 256
-    gres: "gpu:h100:8"
-    qos: "explore"
-    timeout_min: 720
-    setup: ["export DEBUGVAR=$(scontrol show hostnames $SLURM_JOB_NODELIST)",
-            export MASTER_ADDR="$(scontrol show hostnames $SLURM_JOB_NODELIST | head -n 1)",
-            "export MASTER_PORT=$(for port in $(shuf -i 30000-65500 -n 20); do if [[ $(netstat -tupln 2>&1 | grep $port | wc -l) -eq 0 ]] ; then echo $port; break; fi; done;)",]
+# Model flavour: ddpwm (this repository) or dinowm (original DINO-WM baseline)
+model_type: ddpwm
 
-# model to load for planning
-ckpt_base_path: /path/to/save  # put absolute path here. Checkpoints will be loaded from ${ckpt_base_path}/outputs
+# Required (no default, to prevent evaluating stale weights by accident)
+ddpwm_ckpt: null
+# Optional override layers. Every stage is trained on top of the previous one, so a checkpoint
+# contains its own modules plus everything it inherited (classifier -> predictor -> LRM); an LRM
+# checkpoint trained here therefore needs no extra argument. Passing one of these overrides the
+# corresponding modules of the evaluated checkpoint, highest priority last:
+#
+#     ddpwm_cls_ckpt       (highest: history fusion + localizer + action/proprio encoders)
+#     ddpwm_predictor_ckpt (middle:  the sparse predictor; also its copies of the above)
+#     ddpwm_ckpt           (lowest:  whatever the evaluated checkpoint itself carries)
+#
+# Needed e.g. for a checkpoint converted from the original reference runs, which carries the LRM
+# but not the localizer: pass the classifier it was trained with. The evaluation refuses to run
+# with randomly initialized mask / prediction modules instead of reporting meaningless numbers.
+ddpwm_predictor_ckpt: null
+ddpwm_cls_ckpt: null
+
+# Only used when model_type=dinowm
+ckpt_base_path: null
 model_name: null
 model_epoch: latest
 
+# Data (PushT). No default: pass data_path=<dir> on the command line, or export
+# $DDPWM_PUSHT_DATA=<.../pusht_noise>, or export $DDPWM_DATA_DIR=<root> (the same root the trainer
+# takes via --data-dir) and let planning resolve <root>/pusht_noise. See dino_planning.plan.
+# The dataset is not shipped with the code.
+data_path: null
+
+# Evaluation size and goal
 seed: 99
 n_evals: 50
-goal_source: 'dset'
-goal_H: 5 
-n_plot_samples: 10
+# Goals always come from the dataset (`PlanWorkspace.prepare_targets` samples a trajectory of
+# goal_H * frameskip + 1 frames from the validation split); the reference implementation's
+# `goal_source` switch is not ported, so no key is offered here.
 
+# Deterministic planning (cuDNN deterministic kernels + fixed cuBLAS workspace). Needed when two
+# code revisions or two checkpoints have to be compared bit-for-bit on the same machine; ~10%
+# slower. The CEM sampler uses torch's global RNG, which `seed` already fixes.
+deterministic: false
+
+# Separate knob for the *planning* noise. `seed` above fixes the scenes (goal sampling, per-episode
+# env seeds) and is what results are labelled with; the CEM candidate noise is drawn from torch's
+# global RNG afterwards. Setting `plan_rng_seed` re-seeds that global RNG right after the scenes are
+# sampled, so the same scenes (same `seed`) can be planned with different noise draws -- useful to
+# pick a draw deliberately instead of gambling, and to reproduce a specific evaluation exactly:
+#
+#     seed=99 plan_rng_seed=1234        # same 50 scenes, planner noise from seed 1234
+#
+# `null` (default) keeps the reference behaviour: the planner continues the stream that scene
+# sampling left behind.
+plan_rng_seed: null
+
+goal_H: 5
 debug_dset_init: False
 
+# Debug aid (off by default): plan and score only these 0-based episode indices of the sampled
+# batch. The CEM still draws its candidate noise for every episode, so the selected episodes
+# reproduce a full run exactly while the rollouts of the other episodes are skipped; the reported
+# success rate then refers to the selected indices only. Useful to re-check a single borderline
+# scene (e.g. `eval_episodes=[27,30]`) in minutes instead of the full 50-scene evaluation.
+eval_episodes: null
+
+# Output directory for this evaluation (injected by run_eval.sh; null -> hydra run dir)
+eval_dir: null
+
+# Cost function: sparse mask is the default (matches the paper/reproduction protocol)
+use_sparse_cost: true
+sparse_threshold: 0.1
+sparse_dilation: 4
+
 objective:
-  _target_: planning.objectives.create_objective_fn
+  _target_: dino_planning.objectives.create_objective_fn
   alpha: 1
   base: 2
   mode: last
 
 planner:
-  _target_: planning.mpc.MPCPlanner
-  max_iter: null 
+  _target_: dino_planning.mpc.MPCPlanner
+  max_iter: 3
   n_taken_actions: 5
   sub_planner:
-    target: planning.cem.CEMPlanner
+    target: dino_planning.cem.CEMPlanner
     horizon: 5
     topk: 30
     num_samples: 300
     var_scale: 1
     opt_steps: 30
-    eval_every: 1
+    eval_every: 5
   name: mpc_cem
-

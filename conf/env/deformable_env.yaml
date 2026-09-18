@@ -1,20 +1,17 @@
+# Dataset wiring for one environment (single source of truth).
+# train_ddpwm.py::build_dataset() reads this file, injects num_hist / num_pred / frameskip /
+# data_path / transform into `dataset`, and instantiates the loader given by dataset._target_.
+# Adding an environment = adding a YAML file here; no Python changes required.
+# A run config may override individual keys through its optional top-level `env:` block.
+# data_root/data_subdir point at the PARENT directory (e.g. .../deformable);
+# the loader appends object_name internally (rope / granular).
 name: deformable_env
-args: []
-kwargs: 
-  object_name: "granular"
-
-load_dir: ""
-
+# No default root: the dataset is not shipped. Set it with --data-dir <root> or $DDPWM_DATA_DIR.
+data_root: null
+data_subdir: deformable
 dataset:
-  _target_: "datasets.deformable_env_dset.load_deformable_dset_slice_train_val"
+  _target_: dsets.deformable_env_dset.load_deformable_dset_slice_train_val
   n_rollout: null
-  normalize_action: ${normalize_action}
-  data_path: ${oc.env:DATASET_DIR}/deformable
-  object_name: "granular"
+  normalize_action: true
   split_ratio: 0.9
-  transform:
-    _target_: "datasets.img_transforms.default_transform"
-    img_size: ${img_size}
-
-decoder_path: null
-num_workers: 16
+  object_name: rope                        # override with --object-name (rope / granular)
